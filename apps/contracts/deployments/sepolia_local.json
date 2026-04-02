@@ -1,0 +1,17 @@
+{
+  "chainKey": "sepolia_local",
+  "chainId": 11155111,
+  "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "deployedAt": "2026-03-27T21:22:26.968Z",
+  "deployer": "0xAeC2a1EcA0E91d732aF2044dA4A5e9dAaC149149",
+  "stablecoin": "0xfd0d92f0B63Ce4922E531d21b92f57E0AF04da94",
+  "stablecoinName": "Mock Tether",
+  "stablecoinSymbol": "USDT",
+  "valcore": "0x783a3cCf794Eb4eDaD3826A4F96Dc7479153Ccf5",
+  "treasury": "0x4f71e97D43b8FebCF00fCc0463F158b0Fd746566",
+  "pauser": "0xa009e5DAF6B56Fac65b912aEbBd7E2eCb1714061",
+  "auditor": "0x7D2b1330EFA999F6aD93A598e9f6cF2298E1d1Ef",
+  "oracleAccount": "0x34d884E29e99BF0aD9B20D409Ae864c7A6c862A9",
+  "deployMockStablecoin": false,
+  "minDepositWei": "50000000000000000000"
+}
