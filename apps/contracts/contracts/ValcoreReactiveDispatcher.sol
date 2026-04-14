@@ -58,7 +58,8 @@ contract ValcoreReactiveDispatcher is AbstractReactive {
 
   function dispatch(bytes calldata payload, uint64 gasLimit) external onlyOperator {
     if (payload.length == 0 || gasLimit == 0) revert InvalidDispatchPayload();
-    emit DispatchRequested(keccak256(payload), gasLimit);
+    bytes32 payloadHash = keccak256(payload);
+    emit DispatchRequested(payloadHash, gasLimit);
     IValcoreReactiveTrigger(triggerContract).trigger(payload, gasLimit);
   }
 

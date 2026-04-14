@@ -54,6 +54,7 @@ export type RuntimeChainConfig = {
   rpcUrl: string;
   explorerUrl: string;
   nativeSymbol: string;
+  nativeTokenAddress: string | null;
   valcoreAddress: string | null;
   stablecoinAddress: string | null;
   treasuryAddress: string | null;
@@ -92,6 +93,7 @@ export const getRuntimeChainConfig = async (): Promise<RuntimeChainConfig> => {
     rpcUrl,
     explorerUrl: normalizeValue(env.CHAIN_EXPLORER_URL) ?? "",
     nativeSymbol: requireText(env.CHAIN_NATIVE_SYMBOL, "CHAIN_NATIVE_SYMBOL"),
+    nativeTokenAddress: normalizeAddress(env.CHAIN_NATIVE_TOKEN_ADDRESS),
     valcoreAddress: normalizeAddress(env.VALCORE_ADDRESS),
     stablecoinAddress: normalizeAddress(env.STABLECOIN_ADDRESS),
     treasuryAddress: normalizeAddress(env.TREASURY_ADDRESS),

@@ -226,9 +226,14 @@ async function main() {
     ["function coverDebt()"],
     reactiveDeployer,
   );
-  const dispatcherDebtTx = await dispatcherAdmin.coverDebt();
-  await dispatcherDebtTx.wait();
-  console.log(`dispatcher debt covered: ${dispatcherDebtTx.hash}`);
+  try {
+    const dispatcherDebtTx = await dispatcherAdmin.coverDebt();
+    await dispatcherDebtTx.wait();
+    console.log(`dispatcher debt covered: ${dispatcherDebtTx.hash}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`dispatcher debt cover skipped: ${message}`);
+  }
 
   const dispatcherOperator = new ethers.Contract(
     dispatcherAddress,

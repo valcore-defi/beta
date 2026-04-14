@@ -758,8 +758,8 @@
       ]
     },
     "C:\\Users\\erkan\\Desktop\\Projects\\Valcore\\Valcore-core\\apps\\contracts-evm\\contracts\\ValcoreReactiveDispatcher.sol": {
-      "lastModificationDate": 1774681549902,
-      "contentHash": "1e623b21889033bac8a2b279a49bd120",
+      "lastModificationDate": 1776126655624,
+      "contentHash": "ce4696eff85bb1f94bae8903b92ca85e",
       "sourceName": "contracts/ValcoreReactiveDispatcher.sol",
       "solcConfig": {
         "version": "0.8.24",

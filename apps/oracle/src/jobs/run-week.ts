@@ -337,7 +337,7 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
         targetStatus: "DRAFT_OPEN",
       },
     });
-    const txHash = intent.tx_hash ? String(intent.tx_hash).toLowerCase() : null;
+    let txHash = intent.tx_hash ? String(intent.tx_hash).toLowerCase() : null;
     const existingWeekCoins = await getWeekCoins(weekId);
     const ensureDraftDataPresent = () => {
       if (existingWeekCoins.length === 0) {
@@ -374,21 +374,29 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
         return;
       }
       if (isReactiveEvm) {
+        const intentState = String((intent as { status?: unknown }).status ?? "").toLowerCase();
+        if ((intentState === "failed" || intentState === "error") && onchainStatus === 0) {
+          txHash = null;
+        }
         const pendingSinceMs = getIntentUpdatedAtMs(intent as { updated_at?: unknown });
         const reactiveStallGraceMs = Math.max(15_000, Number(env.REACTIVE_STALL_GRACE_SECONDS ?? "120") * 1000);
-        if (pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs) {
-          throw new Error(
-            `DETERMINISTIC: reactive create callback timeout for week ${weekId}; tx=${txHash}; on-chain status=${onchainStatus}`,
-          );
+        if (pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs && onchainStatus === 0) {
+          txHash = null;
         }
-        console.log(
-          `[run-week] fast-path pending reactive callback for week ${weekId}; tx=${txHash}; on-chain status=${onchainStatus}`,
-        );
-        return;
+        if (!txHash) {
+          // stale reactive tx hash cleared; continue with normal create flow below
+        } else {
+          console.log(
+            `[run-week] fast-path pending reactive callback for week ${weekId}; tx=${txHash}; on-chain status=${onchainStatus}`,
+          );
+          return;
+        }
       }
-      throw new Error(
-        `DETERMINISTIC: week ${weekId} create intent submitted but on-chain status is ${onchainStatus} (expected 1)`,
-      );
+      if (txHash) {
+        throw new Error(
+          `DETERMINISTIC: week ${weekId} create intent submitted but on-chain status is ${onchainStatus} (expected 1)`,
+        );
+      }
     }
   }
 
@@ -505,7 +513,7 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
     stats[categoryId]++;
 
     // Download logo from CoinCap
-    const imagePath = await downloadCoinLogo(symbol, coin.id);
+    const imagePath = await downloadCoinLogo(symbol);
 
     // Insert coin with determined category
     await upsertCoin({
@@ -781,7 +789,9 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
     const scheduleIsStale = lockAt.getTime() <= nowMs + minLockLeadMs;
     if (scheduleIsStale) {
       const previousWeekId = weekId;
-      const nextLockAt = new Date(nowMs + draftHoursForSchedule * 60 * 60 * 1000);
+      const draftWindowMs = Math.floor(draftHoursForSchedule * 60 * 60 * 1000);
+      const effectiveLockLeadMs = Math.max(draftWindowMs, minLockLeadMs);
+      const nextLockAt = new Date(nowMs + effectiveLockLeadMs);
       const nextStartAt = nextLockAt;
       const nextEndAt = new Date(nextLockAt.getTime() + weekDaysForSchedule * 24 * 60 * 60 * 1000);
       const nextWeekId = String(Math.floor(nextStartAt.getTime() / 1000));
@@ -908,20 +918,28 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
       const onchainWeek = await getOnchainWeekState(leagueAddress, BigInt(weekId));
       const onchainStatus = Number(onchainWeek.status ?? 0);
       if (onchainStatus !== 1) {
+        const intentState = String((intent as { status?: unknown }).status ?? "").toLowerCase();
+        if ((intentState === "failed" || intentState === "error") && onchainStatus === 0) {
+          txHash = null;
+          reactiveTxHash = null;
+        }
         const pendingSinceMs = getIntentUpdatedAtMs(intent as { updated_at?: unknown });
         const reactiveStallGraceMs = Math.max(
           15_000,
           Number(env.REACTIVE_STALL_GRACE_SECONDS ?? "120") * 1000,
         );
-        if (pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs) {
-          throw new Error(
-            `DETERMINISTIC: reactive create callback timeout for week ${weekId}; tx=${txHash}; on-chain status=${onchainStatus}`,
-          );
+        if (pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs && onchainStatus === 0) {
+          txHash = null;
+          reactiveTxHash = null;
         }
-        console.log(
-          `[run-week] reactive callback pending for week ${weekId}; tx=${txHash}; current on-chain status=${onchainStatus}`,
-        );
-        return;
+        if (!txHash) {
+          // stale failed tx hash cleared; allow fresh reactive dispatch below
+        } else {
+          console.log(
+            `[run-week] reactive callback pending for week ${weekId}; tx=${txHash}; current on-chain status=${onchainStatus}`,
+          );
+          return;
+        }
       }
     }
 
