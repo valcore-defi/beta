@@ -604,8 +604,9 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
 
   // ==========================================
 
-    // Filter coins by their actual market cap rank, then rebalance position pools
-  // so at least one valid 11-slot strategy is always constructible.
+  // Filter coins by market-cap rank buckets.
+  // IMPORTANT: Do not move coins across role buckets (DEF/MID/FWD).
+  // Each role must stay strictly inside its own rank window.
   const filterByRank = (coins: typeof eligibleWithPrice, startRank: number, endRank: number) =>
     coins.filter((c) => c.rank >= startRank && c.rank <= endRank);
 
@@ -615,13 +616,6 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
     MID: filterByRank(eligibleWithPrice, POSITION_RULES.MID.startRank, POSITION_RULES.MID.endRank),
     FWD: filterByRank(eligibleWithPrice, POSITION_RULES.FWD.startRank, POSITION_RULES.FWD.endRank),
   };
-
-  const desiredByPosition: Record<"GK" | "DEF" | "MID" | "FWD", number> = {
-    GK: POSITION_RULES.GK.count,
-    DEF: POSITION_RULES.DEF.count,
-    MID: POSITION_RULES.MID.count,
-    FWD: POSITION_RULES.FWD.count,
-  };
   // Hard minimums required to build at least one valid 11-slot strategy.
   const hardMinByPosition: Record<"GK" | "DEF" | "MID" | "FWD", number> = {
     GK: roleSlotCounts.GK,
@@ -629,21 +623,6 @@ export const runWeek = async (options: RunWeekOptions = {}) => {
     MID: roleSlotCounts.MID,
     FWD: roleSlotCounts.FWD,
   };
-  const donorPriority: Record<"DEF" | "MID" | "FWD", Array<"DEF" | "MID" | "FWD">> = {
-    DEF: ["MID", "FWD"],
-    MID: ["DEF", "FWD"],
-    FWD: ["MID", "DEF"],
-  };
-
-  for (const target of ["DEF", "MID", "FWD"] as const) {
-    while (pools[target].length < desiredByPosition[target]) {
-      const donor = donorPriority[target].find((key) => pools[key].length > hardMinByPosition[key]);
-      if (!donor) break;
-      const moved = pools[donor].pop();
-      if (!moved) break;
-      pools[target].push(moved);
-    }
-  }
 
   for (const key of ["GK", "DEF", "MID", "FWD"] as const) {
     pools[key].sort((a, b) => a.rank - b.rank);
