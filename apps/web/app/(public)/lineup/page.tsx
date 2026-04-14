@@ -561,7 +561,7 @@ export default function LineupPage() {
     } catch {
       // Ignore coin cache read issues.
     }
-  }, [weekId]);
+  }, [weekId, weekStatus]);
 
   useLayoutEffect(() => {
     if (!weekId) {
@@ -1455,7 +1455,7 @@ export default function LineupPage() {
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [startPriceTransition, weekId]);
+  }, [startPriceTransition, weekId, weekStatus]);
 
   useEffect(() => {
     const prev = lastPriceRef.current;
@@ -3840,7 +3840,7 @@ export default function LineupPage() {
                 </div>
                 <div className="board-cooldown-sub">
                   {isWeekLockedTransition
-                    ? "Draft locked. Waiting for server to start the next week."
+                    ? "Draft locked. Initializing the next week."
                     : "Validation + cooldown in progress"}
                 </div>
                 {!isWeekLockedTransition ? (
@@ -4618,6 +4618,4 @@ export default function LineupPage() {
     </>
   );
 }
-
-
 

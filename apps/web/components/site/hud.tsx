@@ -21,7 +21,7 @@ export function Hud() {
   }
   const stablecoinAddress = profile.stablecoinAddress;
   const pathname = usePathname();
-  const showMoves = pathname.startsWith("/lineup");
+  const showMoves = pathname.startsWith("/strategy") || pathname.startsWith("/lineup");
   const { statusLabel, countdownText, moves, week, swapMode, setSwapMode } = useHudContext();
   const {
     address,
@@ -428,12 +428,12 @@ export function Hud() {
   const movesTotal = moves?.total ?? 0;
   const isWeekActive = week?.status === "ACTIVE";
   const showGuideButton = showMoves;
-  const showMovesPanel = showMoves && isWeekActive && moves !== null;
+  const showMovesPanel = showMoves && isWeekActive;
 
-  const openHowToPlay = (section: "tactical-moves" | "what-is-this", markSeen = false) => {
+  const openProtocolGuide = (section: "tactical-moves" | "welcome", markSeen = false) => {
     if (typeof window === "undefined") return;
     window.dispatchEvent(
-      new CustomEvent("valcore:open-how-to-play", {
+      new CustomEvent("valcore:open-protocol-guide", {
         detail: { section, markSeen },
       }),
     );
@@ -462,13 +462,13 @@ export function Hud() {
             <button
               type="button"
               className="hud-guide-button"
-              onClick={() => openHowToPlay("what-is-this", true)}
+              onClick={() => openProtocolGuide("welcome", true)}
             >
               <svg viewBox="0 0 24 24" className="hud-guide-icon" aria-hidden="true">
                 <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v14.5a1.5 1.5 0 0 1-1.5 1.5H6.5A2.5 2.5 0 0 1 4 17.5v-11Z" />
                 <path d="M8 8h7M8 11h7M8 14h5" />
               </svg>
-              <span>How to Play</span>
+              <span>How It Works</span>
             </button>
           ) : null}
           {showMovesPanel ? (
@@ -494,7 +494,7 @@ export function Hud() {
                     type="button"
                     className="hud-help-inline"
                     aria-label="How tactical moves work"
-                    onClick={() => openHowToPlay("tactical-moves")}
+                    onClick={() => openProtocolGuide("tactical-moves")}
                   >
                     ?
                   </button>
