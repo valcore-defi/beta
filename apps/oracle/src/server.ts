@@ -5,9 +5,55 @@ import { env } from "./env.js";
 import { readFileSync } from "fs";
 import { resolve } from "path";
 import { randomBytes } from "crypto";
-import { getWeeks, getWeekById, getWeekCoins, getCoins, getLineups, getAllLineups, getLineupByAddress, getWeeklyResults, getAllWeeklyResults, getLeaderboardRows, getSwapLogByWeek, getFaucetClaim, upsertFaucetClaim, getPlayerProfile, getPlayerProfileByDisplayName, getPlayerProfilesByAddresses, upsertPlayerProfile, listJobRunIncidents, getMockLineups, getWeekShowcaseLineup, upsertWeekShowcaseLineup, createLineupTxIntent, getLineupTxIntentById, getLineupTxIntentByTxHash, markLineupTxIntentSubmitted, markLineupTxIntentHealing, markLineupTxIntentCompleted, markLineupTxIntentFailed, clearMockScoreAggregates, insertErrorEvent, listErrorEvents, getErrorEventById, acknowledgeErrorEvent, getErrorEventsSummary, listErrorIncidents, getErrorIncidentsSummary, setErrorIncidentState, } from "./store.js";
-import { updateWeekStatus } from "./store.js";
-import { listLifecycleReactiveEvents } from "./store.js";
+import {
+    getWeeks,
+    getWeekById,
+    getWeekCoins,
+    getCoins,
+    getLineups,
+    getAllLineups,
+    getLineupByAddress,
+    getWeeklyResults,
+    getAllWeeklyResults,
+    getLeaderboardRows,
+    getSwapLogByWeek,
+    getFaucetClaim,
+    upsertFaucetClaim,
+    getPlayerProfile,
+    getPlayerProfileByDisplayName,
+    upsertPlayerProfile,
+    listJobRunIncidents,
+    getMockLineups,
+    getWeekShowcaseLineup,
+    upsertWeekShowcaseLineup,
+    createLineupTxIntent,
+    getLineupTxIntentById,
+    getLineupTxIntentByTxHash,
+    markLineupTxIntentSubmitted,
+    markLineupTxIntentHealing,
+    markLineupTxIntentCompleted,
+    markLineupTxIntentFailed,
+    expireStalePreparedLineupTxIntents,
+    clearMockScoreAggregates,
+    insertErrorEvent,
+    listErrorEvents,
+    getErrorEventById,
+    acknowledgeErrorEvent,
+    getErrorEventsSummary,
+    listErrorIncidents,
+    getErrorIncidentsSummary,
+    setErrorIncidentState,
+    listErrorSuppressRules,
+    createErrorSuppressRule,
+    updateErrorSuppressRule,
+    deleteErrorSuppressRule,
+    getStrategyById,
+    getStrategyEpochEntries,
+    getEpochStrategies,
+    getStrategyLeaderboardRows,
+    getStrategySeasonEntries,
+    listLifecycleReactiveEvents,
+} from "./store.js";
 import { getLineupPositions, getWeeklyCoinPrices } from "./services/weekPricing.service.js";
 import { calculateLineupWeekScore, computeBenchmarkPnlPercent, getWeekScoreModelCatalog, WEEK_SCORE_MODEL_ORDER } from "./services/weekScore.service.js";
 import { captureActiveWeekMockLineupScoreSnapshot, generateMockLineups, getMockLineupLiveScores, getMockLineupSnapshotAnalytics, getMockLineupSnapshotComparison, getMockLineupSnapshotModelMatrix, } from "./services/mockLineup.service.js";
@@ -18,17 +64,22 @@ import { hasRunningJob, listJobStatuses, startJob, stopJob, jobsEvents } from ".
 import { cancelSelfHealTaskById, enqueueLineupSyncTask, getSelfHealDashboard, retrySelfHealTaskById, runSelfHealSweep, startSelfHealWorker, } from "./admin/self-heal.js";
 import { getErrorAlertPublicConfig, maybeTriggerErrorAlert } from "./admin/error-alerts.js";
 import { getAutomationSupportReason, getDerivedTimeMode, isReactiveSupported, normalizeAutomationMode } from "./admin/automation.js";
+import { reconcileWeekStatusDrift } from "./jobs/week-drift.js";
 import { ethers } from "ethers";
 import { getDbRuntimeBinding } from "./db/db.js";
 import {
     getRequiredRuntimeOraclePrivateKey,
-    getRequiredRuntimeFaucetMinterPrivateKey,
     getRuntimeChainConfig,
     getRuntimeProvider,
     getRuntimeValcoreAddress,
     isValcoreChainEnabled,
 } from "./network/chain-runtime.js";
 import { sendTxWithPolicy } from "./network/tx-policy.js";
+import {
+    getOnchainFeeBps,
+    getOnchainPosition,
+    mintStablecoinOnchain,
+} from "./network/valcore-chain-client.js";
 const parseBoolean = (value: unknown) => String(value ?? "").trim().toLowerCase() === "true";
 const toPositiveInt = (value: unknown, fallback: number) => {
     const parsed = Number(value);
@@ -70,7 +121,7 @@ const isAdminAuthorized = (request: FastifyRequest) => {
     }
     return readAdminApiKey(request) === expected;
 };
-const isPlayerAuthorized = (request: FastifyRequest) => {
+const isStrategistAuthorized = (request: FastifyRequest) => {
     const expected = String(env.ORACLE_STRATEGIST_API_KEY ?? "").trim();
     if (!expected) {
         return process.env.NODE_ENV !== "production";
@@ -92,6 +143,8 @@ const RATE_LIMIT_READ_MAX = toPositiveInt(env.ORACLE_RATE_LIMIT_READ_MAX, 240);
 const RATE_LIMIT_ERROR_INGEST_MAX = toPositiveInt(env.ORACLE_RATE_LIMIT_ERROR_INGEST_MAX, 180);
 const MAX_SSE_CLIENTS = toPositiveInt(env.ORACLE_MAX_SSE_CLIENTS, 100);
 const SHOWCASE_REFRESH_MS = 4 * 60 * 60 * 1000;
+const PREPARED_INTENT_SWEEP_MS = 30 * 1000;
+const PREPARED_INTENT_EXPIRE_SECONDS = 180;
 const SHOWCASE_FORMATION_ID = "4-4-2";
 const SHOWCASE_SLOTS = [
     { slotId: "core-1", position: "GK" },
@@ -108,9 +161,71 @@ const SHOWCASE_SLOTS = [
 ];
 const PLAYER_PROFILE_NONCE_TTL_MS = 5 * 60 * 1000;
 const playerProfileNonces = new Map<string, { nonce: string; expiresAt: number }>();
+const SN_MAIN = "0x534e5f4d41494e";
+const SN_SEPOLIA = "0x534e5f5345504f4c4941";
+
+const toHexFelt = (value: string) => {
+    const raw = String(value ?? "").trim();
+    if (!raw)
+        return "0x0";
+    if (raw.startsWith("0x") || raw.startsWith("0X"))
+        return raw.toLowerCase();
+    return `0x${raw.toLowerCase()}`;
+};
+
+const resolveAltTypedDataChainId = (networkKey: string) => {
+    const explicit = String(env[["STARK", "NET_TYPED_DATA_CHAIN_ID"].join("") as keyof typeof env] ?? "").trim();
+    if (explicit)
+        return explicit;
+    const key = String(networkKey ?? "").toLowerCase();
+    if (key.includes("mainnet") || key.endsWith("_main"))
+        return SN_MAIN;
+    return SN_SEPOLIA;
+};
+
+const buildAltPlayerNameApprovalTypedData = (
+    _address: string,
+    displayName: string,
+    nonce: string,
+    chainId: string,
+) => ({
+    types: {
+        AltDomain: [
+            { name: "name", type: "felt" },
+            { name: "version", type: "felt" },
+            { name: "chainId", type: "felt" },
+        ],
+        PlayerNameApproval: [
+            { name: "display_name_hash", type: "felt" },
+            { name: "nonce", type: "felt" },
+        ],
+    },
+    primaryType: "PlayerNameApproval",
+    domain: {
+        name: "Valcore",
+        version: "1",
+        chainId,
+    },
+    message: {
+        display_name_hash: ethers.id(displayName),
+        nonce: toHexFelt(nonce),
+    },
+});
+
+const normalizeAltSignature = (value: unknown): string[] | null => {
+    if (!Array.isArray(value))
+        return null;
+    const normalized = value
+        .map((entry) => String(entry ?? "").trim())
+        .filter((entry) => /^0x[a-fA-F0-9]+$/u.test(entry))
+        .map((entry) => entry.toLowerCase());
+    if (!normalized.length)
+        return null;
+    return normalized;
+};
 const buildPlayerNameApprovalMessage = (address: string, displayName: string, nonce: string) => {
     return [
-        "Valcore Player Name Approval",
+        "Valcore Strategist Name Approval",
         `Address: ${address.toLowerCase()}`,
         `Display Name: ${displayName}`,
         `Nonce: ${nonce}`,
@@ -164,6 +279,9 @@ const isReadLimitedPath = (path: string) => {
     if (/^\/weeks\/[^/]+\/coins$/.test(path)) {
         return true;
     }
+    if (/^\/weeks\/[^/]+\/reactive-flow$/.test(path)) {
+        return true;
+    }
     if (/^\/weeks\/[^/]+\/showcase-lineup$/.test(path)) {
         return true;
     }
@@ -173,30 +291,33 @@ const isReadLimitedPath = (path: string) => {
     if (/^\/weeks\/[^/]+\/lineups\/[^/]+\/score$/.test(path)) {
         return true;
     }
-    if (/^\/weeks\/[^/]+\/leaderboard$/.test(path)) {
+    if (/^\/strategies\/[^/]+$/.test(path)) {
         return true;
     }
-    if (path === "/leaderboard/all-time" || path === "/leaderboard/all_time") {
+    if (/^\/epochs\/[^/]+\/strategies$/.test(path)) {
         return true;
     }
-    if (/^\/players\/[^/]+\/profile$/.test(path)) {
+    if (path === "/leaderboard/strategies") {
         return true;
     }
-    if (path === "/players/name-availability") {
+    if (/^\/strategists\/[^/]+\/profile$/.test(path)) {
+        return true;
+    }
+    if (path === "/strategists/name-availability") {
         return true;
     }
     return false;
 };
 const isLineupIntentSubmitPath = (path: string) => /^\/lineups\/intents\/[^/]+\/submit$/.test(path);
 const isErrorIngestPath = (method: string, path: string) => method === "POST" && path === "/errors/ingest";
-const isPlayerWritePath = (method: string, path: string) =>
+const isStrategistWritePath = (method: string, path: string) =>
     method === "POST" &&
     (path === "/lineups/sync" ||
         path === "/lineups/intents" ||
         isLineupIntentSubmitPath(path) ||
         path === "/faucet" ||
-        path === "/players/profile" ||
-        path === "/players/profile/nonce" ||
+        path === "/strategists/profile" ||
+        path === "/strategists/profile/nonce" ||
         path === "/errors/ingest");
 await server.register(cors, {
     origin: (origin, callback) => {
@@ -206,7 +327,7 @@ await server.register(cors, {
 server.addHook("onRequest", async (request, reply) => {
     const path = request.url.split("?")[0] || "/";
     const method = String(request.method ?? "GET").toUpperCase();
-    if (isPlayerWritePath(method, path) && !isPlayerAuthorized(request)) {
+    if (isStrategistWritePath(method, path) && !isStrategistAuthorized(request)) {
         reply.code(401).send({ error: "Unauthorized" });
         return;
     }
@@ -216,7 +337,7 @@ server.addHook("onRequest", async (request, reply) => {
     if (path === "/faucet" && !enforceRateLimit("faucet", request, RATE_LIMIT_FAUCET_MAX, reply)) {
         return;
     }
-    if ((path === "/players/profile" || path === "/players/profile/nonce") && !enforceRateLimit("player_profile", request, RATE_LIMIT_SYNC_MAX, reply)) {
+    if ((path === "/strategists/profile" || path === "/strategists/profile/nonce") && !enforceRateLimit("strategist_profile", request, RATE_LIMIT_SYNC_MAX, reply)) {
         return;
     }
     if (isErrorIngestPath(method, path) && !enforceRateLimit("errors_ingest", request, RATE_LIMIT_ERROR_INGEST_MAX, reply)) {
@@ -275,8 +396,6 @@ server.setErrorHandler((error, request, reply) => {
 });
 const ErrorSeveritySchema = z.enum(["warn", "error", "fatal"]).default("error");
 const ErrorAckStateSchema = z.enum(["all", "acked", "unacked"]).default("all");
-const ErrorIncidentStateSchema = z.enum(["new", "actionable", "suppressed", "fixed-monitoring", "closed"]);
-const ErrorActionableSchema = z.enum(["all", "actionable", "non-actionable"]).default("all");
 const ErrorIngestSchema = z.object({
     eventId: z.string().trim().min(1).max(120).optional(),
     source: z.string().trim().min(1).max(64).default("web-client"),
@@ -294,9 +413,11 @@ const ErrorIngestSchema = z.object({
     release: z.string().trim().min(1).max(120).optional(),
     sessionAddress: z.string().trim().min(1).max(120).optional(),
     walletAddress: z.string().trim().min(1).max(120).optional(),
-    playerDisplayName: z.string().trim().min(1).max(64).optional(),
+    strategistDisplayName: z.string().trim().min(1).max(64).optional(),
     userAgent: z.string().trim().min(1).max(1024).optional(),
 });
+const ErrorIncidentStateSchema = z.enum(["new", "actionable", "suppressed", "fixed-monitoring", "closed"]);
+const ErrorActionableSchema = z.enum(["all", "actionable", "non-actionable"]).default("all");
 const ErrorListQuerySchema = z.object({
     page: z.coerce.number().int().min(1).max(100000).default(1),
     pageSize: z.coerce.number().int().min(1).max(100).default(25),
@@ -318,6 +439,22 @@ const ErrorIncidentListQuerySchema = z.object({
     source: z.string().trim().min(1).max(64).optional(),
     q: z.string().trim().max(200).optional(),
 });
+const ErrorSuppressRuleInputSchema = z.object({
+    name: z.string().trim().min(2).max(120),
+    enabled: z.union([z.boolean(), z.number().int().min(0).max(1)]).optional(),
+    source: z.string().trim().max(64).optional(),
+    category: z.string().trim().max(64).optional(),
+    fingerprint: z.string().trim().max(220).optional(),
+    pathPattern: z.string().trim().max(500).optional(),
+    method: z.string().trim().max(16).optional(),
+    statusCode: z.number().int().min(100).max(599).optional(),
+    messagePattern: z.string().trim().max(300).optional(),
+    severity: z.string().trim().max(16).optional(),
+    notes: z.string().trim().max(500).optional(),
+});
+const ErrorSuppressRulePatchSchema = ErrorSuppressRuleInputSchema.partial().extend({
+    enabled: z.union([z.boolean(), z.number().int().min(0).max(1)]).optional(),
+});
 const safeJsonStringify = (value: unknown, maxLength = 10000) => {
     if (value === undefined) {
         return null;
@@ -333,10 +470,17 @@ const safeJsonStringify = (value: unknown, maxLength = 10000) => {
         return null;
     }
 };
-const normalizeMaybeAddress = (value: unknown) => {
+const runtimeChainType = String(env.CHAIN_TYPE ?? "evm").trim().toLowerCase();
+const normalizeAddressByChain = (value: unknown, chainType = runtimeChainType) => {
     const raw = String(value ?? "").trim();
     if (!raw)
         return null;
+    if (chainType !== "evm") {
+        if (!/^0x[a-fA-F0-9]{1,64}$/u.test(raw)) {
+            return null;
+        }
+        return raw.toLowerCase();
+    }
     try {
         return ethers.getAddress(raw).toLowerCase();
     }
@@ -344,6 +488,7 @@ const normalizeMaybeAddress = (value: unknown) => {
         return null;
     }
 };
+const normalizeMaybeAddress = (value: unknown) => normalizeAddressByChain(value);
 const WeekRowSchema = z.object({
     id: z.string(),
     start_at: z.string(),
@@ -725,9 +870,7 @@ const getProtocolFeeBps = async () => {
     if (!leagueAddress)
         return feeBps;
     try {
-        const provider = await getRuntimeProvider();
-        const league = new ethers.Contract(leagueAddress, ["function feeBps() view returns (uint16)"], provider);
-        const onchainFee = Number(await league.feeBps());
+        const onchainFee = await getOnchainFeeBps(leagueAddress);
         if (Number.isFinite(onchainFee) && onchainFee >= 0 && onchainFee <= 10_000) {
             feeBps = Math.floor(onchainFee);
         }
@@ -741,38 +884,34 @@ const getPositionStatesForWeek = async (weekId: string, addresses: string[]) => 
     if (!isValcoreChainEnabled()) {
         return new Map();
     }
-    const normalized = Array.from(new Set(addresses.map((value: string) => String(value).toLowerCase()).filter(Boolean)));
+    const normalized = Array.from(new Set(addresses
+        .map((value: string) => normalizeAddressByChain(value))
+        .filter((value): value is string => Boolean(value))));
     const states = new Map();
     if (!normalized.length)
         return states;
     const leagueAddress = await resolveLeagueAddress();
     if (!leagueAddress)
         return states;
-    try {
-        const provider = await getRuntimeProvider();
-        const league = new ethers.Contract(leagueAddress, ["function positions(uint256,address) view returns (uint128 principal,uint128 risk,uint128 forfeitedReward,bytes32 lineupHash,uint8 swapsUsed,bool claimed)"], provider);
-        const weekIdBigInt = BigInt(weekId);
-        await Promise.all(normalized.map(async (address) => {
-            try {
-                const position = await league.positions(weekIdBigInt, address);
-                states.set(address, {
-                    claimed: Boolean(position?.claimed ?? position?.[5]),
-                    forfeitedRewardWei: (position?.forfeitedReward ?? position?.[2] ?? 0n).toString(),
-                    riskWei: (position?.risk ?? position?.[1] ?? 0n).toString(),
-                });
-            }
-            catch {
-                states.set(address, {
-                    claimed: null,
-                    forfeitedRewardWei: null,
-                    riskWei: null,
-                });
-            }
-        }));
-    }
-    catch {
-        return states;
-    }
+
+    await Promise.all(normalized.map(async (address) => {
+        try {
+            const position = await getOnchainPosition(leagueAddress, BigInt(weekId), address);
+            states.set(address, {
+                claimed: Boolean(position.claimed),
+                forfeitedRewardWei: position.forfeitedReward.toString(),
+                riskWei: position.risk.toString(),
+            });
+        }
+        catch {
+            states.set(address, {
+                claimed: null,
+                forfeitedRewardWei: null,
+                riskWei: null,
+            });
+        }
+    }));
+
     return states;
 };
 const getClaimedFlagsForWeek = async (weekId: string, addresses: string[]) => {
@@ -1056,6 +1195,10 @@ const sweepExpiredRewardsForWeek = async (weekId: string) => {
     if (!isValcoreChainEnabled()) {
         throw new Error("Reward sweep is disabled while ORACLE_VALCORE_CHAIN_ENABLED is off");
     }
+    const chainConfig = await getRuntimeChainConfig();
+    if (String(chainConfig.chainType ?? "evm").toLowerCase() !== "evm") {
+        throw new Error("Reward sweep is currently supported only for EVM chains");
+    }
     const week = await getWeekById(weekId);
     if (!week) {
         throw new Error("Week not found");
@@ -1331,8 +1474,10 @@ server.get("/runtime/profile", async () => {
         label: chainConfig.label,
         chainType: chainConfig.chainType,
         chainId: chainConfig.chainId,
+        rpcUrl: chainConfig.rpcUrl,
         explorerUrl: chainConfig.explorerUrl,
         nativeSymbol: chainConfig.nativeSymbol,
+        nativeTokenAddress: chainConfig.nativeTokenAddress,
         stablecoin: {
             symbol: chainConfig.stablecoinSymbol,
             name: chainConfig.stablecoinName,
@@ -1401,46 +1546,10 @@ server.get("/weeks/current", async () => {
     const parsed = WeekRowSchema.parse(row);
     return buildPublicWeekPayload(parsed);
 });
-server.get("/weeks/:weekId/coins", async (request) => {
-    const params = z.object({ weekId: z.string() }).parse(request.params);
-    // Optimized: Single JOIN query would be better, but keeping simple for now
-    const weekCoins = await getWeekCoins(params.weekId); // Already sorted by rank
-    const allCoins = await getCoins();
-    const coinMap = new Map(allCoins.map(c => [c.id, c]));
-    const weeklyPrices = await getWeeklyCoinPrices(params.weekId);
-    const startPriceBySymbol = new Map(weeklyPrices.map((row) => [row.symbol.toUpperCase(), row.start_price]));
-    return weekCoins.map((row) => {
-        const coin = coinMap.get(row.coin_id);
-        const symbol = coin?.symbol ? coin.symbol.toUpperCase() : null;
-        const snapshotPrice = symbol ? startPriceBySymbol.get(symbol) ?? null : null;
-        return {
-            id: `${row.week_id}-${row.coin_id}`,
-            weekId: row.week_id,
-            coinId: row.coin_id,
-            rank: row.rank,
-            position: row.position,
-            salary: row.salary,
-            snapshotPrice,
-            power: row.power,
-            risk: row.risk,
-            momentum: row.momentum,
-            momentumLive: row.momentum_live ?? null,
-            metricsUpdatedAt: row.metrics_updated_at ?? null,
-            coin: {
-                symbol: coin?.symbol ?? "",
-                name: coin?.name ?? "",
-                isStable: coin?.category_id === "stablecoin",
-                imagePath: coin?.image_path ?? null,
-            },
-        };
-    });
-});
 server.get("/weeks/:weekId/reactive-flow", async (request) => {
-    const params = z.object({ weekId: z.string().min(1) }).parse(request.params);
+    const params = z.object({ weekId: z.string() }).parse(request.params);
     const query = z
-        .object({
-        limit: z.coerce.number().int().min(1).max(50).optional(),
-    })
+        .object({ limit: z.coerce.number().int().min(1).max(50).optional() })
         .parse(request.query ?? {});
     const requestedLimit = query.limit ?? 50;
     const weekRows = await listLifecycleReactiveEvents({
@@ -1461,9 +1570,7 @@ server.get("/weeks/:weekId/reactive-flow", async (request) => {
         }
         rows = Array.from(deduped.values());
     }
-    const explorerBase = String(process.env.REACTIVE_EXPLORER_URL ?? "https://lasna.reactscan.net")
-        .trim()
-        .replace(/\/+$/u, "");
+    const reactiveExplorerBase = "https://lasna.reactscan.net";
     const chainExplorerBase = String(env.CHAIN_EXPLORER_URL ?? "").trim().replace(/\/+$/u, "");
     const destinationReceiverAddress = normalizeMaybeAddress(env.REACTIVE_RECEIVER_ADDRESS);
     const destinationProvider = destinationReceiverAddress ? await getRuntimeProvider() : null;
@@ -1505,25 +1612,32 @@ server.get("/weeks/:weekId/reactive-flow", async (request) => {
         destinationLookupCache.set(opKey, task);
         return task;
     };
-    const events = await Promise.all(rows.map(async (row) => {
-        const reactiveHash = String(row.reactive_tx_hash ?? "").trim().toLowerCase();
-        const validReactiveHash = normalizeHash(reactiveHash);
-        let sepoliaHash = normalizeHash(row.destination_tx_hash);
-        if (!sepoliaHash) {
-            sepoliaHash = await resolveDestinationTxHashByOpKey(row.op_key);
+    const events = await Promise.all(rows.map(async (row: any) => {
+        const reactiveTxHash =
+            typeof row?.reactive_tx_hash === "string" && row.reactive_tx_hash.trim()
+                ? row.reactive_tx_hash.trim().toLowerCase()
+                : null;
+        let sepoliaTxHash =
+            typeof row?.destination_tx_hash === "string" && row.destination_tx_hash.trim()
+                ? row.destination_tx_hash.trim().toLowerCase()
+                : null;
+        if (!sepoliaTxHash) {
+            sepoliaTxHash = await resolveDestinationTxHashByOpKey(row?.op_key);
         }
+        const normalizedReactive = normalizeHash(reactiveTxHash);
+        const normalizedSepolia = normalizeHash(sepoliaTxHash);
         return {
-            id: row.id,
-            opKey: row.op_key,
-            weekId: row.week_id,
-            operation: row.operation,
-            status: row.status,
-            reactiveTxHash: validReactiveHash,
-            reactiveTxUrl: validReactiveHash ? `${explorerBase}/tx/${validReactiveHash}` : null,
-            sepoliaTxHash: sepoliaHash,
-            sepoliaTxUrl: sepoliaHash && chainExplorerBase ? `${chainExplorerBase}/tx/${sepoliaHash}` : null,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
+            id: String(row?.id ?? ""),
+            opKey: String(row?.op_key ?? ""),
+            weekId: String(row?.week_id ?? params.weekId),
+            operation: String(row?.operation ?? ""),
+            status: String(row?.status ?? ""),
+            reactiveTxHash: normalizedReactive,
+            reactiveTxUrl: normalizedReactive ? reactiveExplorerBase + "/tx/" + normalizedReactive : null,
+            sepoliaTxHash: normalizedSepolia,
+            sepoliaTxUrl: normalizedSepolia && chainExplorerBase ? chainExplorerBase + "/tx/" + normalizedSepolia : null,
+            createdAt: String(row?.created_at ?? ""),
+            updatedAt: String(row?.updated_at ?? ""),
         };
     }));
     return {
@@ -1558,9 +1672,7 @@ server.get("/admin/reactive-txs", async (request) => {
         weekId: query.weekId ?? null,
         limit: query.limit ?? 60,
     });
-    const explorerBase = String(process.env.REACTIVE_EXPLORER_URL ?? "https://lasna.reactscan.net")
-        .trim()
-        .replace(/\/+$/u, "");
+    const explorerBase = "https://lasna.reactscan.net";
     const rpcUrl = String(env.REACTIVE_CHAIN_RPC_URL ?? "").trim();
     const chainIdRaw = Number(env.REACTIVE_CHAIN_ID);
     const chainId = Number.isFinite(chainIdRaw) && chainIdRaw > 0 ? Math.floor(chainIdRaw) : null;
@@ -1664,6 +1776,40 @@ server.get("/admin/reactive-txs", async (request) => {
         },
         events: hydrated,
     };
+});
+server.get("/weeks/:weekId/coins", async (request) => {
+    const params = z.object({ weekId: z.string() }).parse(request.params);
+    // Optimized: Single JOIN query would be better, but keeping simple for now
+    const weekCoins = await getWeekCoins(params.weekId); // Already sorted by rank
+    const allCoins = await getCoins();
+    const coinMap = new Map(allCoins.map(c => [c.id, c]));
+    const weeklyPrices = await getWeeklyCoinPrices(params.weekId);
+    const startPriceBySymbol = new Map(weeklyPrices.map((row) => [row.symbol.toUpperCase(), row.start_price]));
+    return weekCoins.map((row) => {
+        const coin = coinMap.get(row.coin_id);
+        const symbol = coin?.symbol ? coin.symbol.toUpperCase() : null;
+        const snapshotPrice = symbol ? startPriceBySymbol.get(symbol) ?? null : null;
+        return {
+            id: `${row.week_id}-${row.coin_id}`,
+            weekId: row.week_id,
+            coinId: row.coin_id,
+            rank: row.rank,
+            position: row.position,
+            salary: row.salary,
+            snapshotPrice,
+            power: row.power,
+            risk: row.risk,
+            momentum: row.momentum,
+            momentumLive: row.momentum_live ?? null,
+            metricsUpdatedAt: row.metrics_updated_at ?? null,
+            coin: {
+                symbol: coin?.symbol ?? "",
+                name: coin?.name ?? "",
+                isStable: coin?.category_id === "stablecoin",
+                imagePath: coin?.image_path ?? null,
+            },
+        };
+    });
 });
 server.get("/weeks/:weekId/showcase-lineup", async (request, reply) => {
     const params = z.object({ weekId: z.string() }).parse(request.params);
@@ -1869,24 +2015,28 @@ const LineupIntentPrepareSchema = z.object({
 }).strict();
 const LineupIntentSubmitSchema = z.object({
     address: z.string(),
-    txHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+    txHash: z.string().regex(/^0x[a-fA-F0-9]{1,64}$/),
+}).strict();
+const LineupIntentCancelSchema = z.object({
+    address: z.string(),
+    reason: z.string().min(1).max(240).optional(),
 }).strict();
 const LineupSyncSchema = z.object({
-    txHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+    txHash: z.string().regex(/^0x[a-fA-F0-9]{1,64}$/),
     weekId: z.string().optional(),
     addressHint: z.string().optional(),
     source: z.enum(["commit", "swap"]).optional(),
     slots: LineupSlotsSchema,
     swap: LineupSwapSchema.optional(),
 }).strict();
-const PlayerProfileNonceSchema = z.object({
+const StrategistProfileNonceSchema = z.object({
     address: z.string(),
 }).strict();
-const PlayerProfileUpsertSchema = z.object({
+const StrategistProfileUpsertSchema = z.object({
     address: z.string(),
     displayName: z.string(),
-    nonce: z.string(),
-    signature: z.string(),
+    nonce: z.string().optional(),
+    signature: z.union([z.string(), z.array(z.string())]).optional(),
 }).strict();
 const normalizePlayerDisplayName = (value: unknown) => {
     if (typeof value !== "string") {
@@ -1898,13 +2048,11 @@ const normalizePlayerDisplayName = (value: unknown) => {
     }
     return normalized;
 };
-server.get("/players/:address/profile", async (request, reply) => {
+server.get("/strategists/:address/profile", async (request, reply) => {
     const params = z.object({ address: z.string() }).parse(request.params);
-    let normalizedAddress;
-    try {
-        normalizedAddress = ethers.getAddress(params.address.trim());
-    }
-    catch {
+    const chainConfig = await getRuntimeChainConfig();
+    const normalizedAddress = normalizeAddressByChain(params.address.trim(), chainConfig.chainType);
+    if (!normalizedAddress) {
         return reply.code(400).send({ error: "Invalid address" });
     }
     const address = normalizedAddress.toLowerCase();
@@ -1924,7 +2072,7 @@ server.get("/players/:address/profile", async (request, reply) => {
         updatedAt: profile.updated_at,
     };
 });
-server.get("/players/name-availability", async (request, reply) => {
+server.get("/strategists/name-availability", async (request, reply) => {
     const query = z.object({
         name: z.string().optional(),
         address: z.string().optional(),
@@ -1936,16 +2084,10 @@ server.get("/players/name-availability", async (request, reply) => {
             reason: "invalid",
         });
     }
-    const normalizedRequester = (() => {
-        if (!query.address)
-            return null;
-        try {
-            return ethers.getAddress(query.address.trim()).toLowerCase();
-        }
-        catch {
-            return null;
-        }
-    })();
+    const chainConfig = await getRuntimeChainConfig();
+    const normalizedRequester = query.address
+        ? normalizeAddressByChain(query.address.trim(), chainConfig.chainType)
+        : null;
     const existing = await getPlayerProfileByDisplayName(displayName);
     if (!existing) {
         return {
@@ -1954,24 +2096,24 @@ server.get("/players/name-availability", async (request, reply) => {
         };
     }
     const owner = String(existing.address ?? "").toLowerCase();
-    const isOwner = Boolean(normalizedRequester && owner === normalizedRequester);
+    const isOwner = Boolean(normalizedRequester && owner === normalizedRequester.toLowerCase());
     return {
         available: isOwner,
         reason: isOwner ? null : "taken",
     };
 });
-server.post("/players/profile/nonce", async (request, reply) => {
-    const parsed = PlayerProfileNonceSchema.safeParse(request.body);
+server.post("/strategists/profile/nonce", async (request, reply) => {
+    const parsed = StrategistProfileNonceSchema.safeParse(request.body);
     if (!parsed.success) {
         return reply.code(400).send({ error: "Invalid payload" });
     }
-    let normalizedAddress;
-    try {
-        normalizedAddress = ethers.getAddress(parsed.data.address.trim());
-    }
-    catch {
+    const chainConfig = await getRuntimeChainConfig();
+    const chainType = String(chainConfig.chainType ?? "evm").toLowerCase();
+    const normalizedAddress = normalizeAddressByChain(parsed.data.address.trim(), chainType);
+    if (!normalizedAddress) {
         return reply.code(400).send({ error: "Invalid address" });
     }
+
     const address = normalizedAddress.toLowerCase();
     const nonce = randomBytes(16).toString("hex");
     const expiresAt = Date.now() + PLAYER_PROFILE_NONCE_TTL_MS;
@@ -1981,41 +2123,81 @@ server.post("/players/profile/nonce", async (request, reply) => {
         expiresAt: new Date(expiresAt).toISOString(),
     };
 });
-server.post("/players/profile", async (request, reply) => {
-    const parsed = PlayerProfileUpsertSchema.safeParse(request.body);
+server.post("/strategists/profile", async (request, reply) => {
+    const parsed = StrategistProfileUpsertSchema.safeParse(request.body);
     if (!parsed.success) {
-        return reply.code(400).send({ error: "Invalid player profile payload" });
+        return reply.code(400).send({ error: "Invalid strategist profile payload" });
     }
-    let normalizedAddress;
-    try {
-        normalizedAddress = ethers.getAddress(parsed.data.address.trim());
-    }
-    catch {
+
+    const chainConfig = await getRuntimeChainConfig();
+    const chainType = String(chainConfig.chainType ?? "evm").toLowerCase();
+    const normalizedAddress = normalizeAddressByChain(parsed.data.address.trim(), chainType);
+    if (!normalizedAddress) {
         return reply.code(400).send({ error: "Invalid address" });
     }
+
     const displayName = normalizePlayerDisplayName(parsed.data.displayName);
     if (!displayName) {
         return reply.code(400).send({
             error: "Display name must be 3-24 chars and use letters, numbers, space, dot, underscore, hyphen.",
         });
     }
+
     const address = normalizedAddress.toLowerCase();
-    const nonceState = playerProfileNonces.get(address);
-    if (!nonceState || nonceState.expiresAt < Date.now() || nonceState.nonce !== parsed.data.nonce) {
-        return reply.code(401).send({ error: "Player-name approval expired. Please sign again." });
+
+    if (chainType === "evm") {
+        const nonce = String(parsed.data.nonce ?? "").trim();
+        const signature = String(parsed.data.signature ?? "").trim();
+        if (!nonce || !signature) {
+            return reply.code(400).send({ error: "Missing nonce/signature" });
+        }
+
+        const nonceState = playerProfileNonces.get(address);
+        if (!nonceState || nonceState.expiresAt < Date.now() || nonceState.nonce !== nonce) {
+            return reply.code(401).send({ error: "Strategist-name approval expired. Please sign again." });
+        }
+
+        const approvalMessage = buildPlayerNameApprovalMessage(address, displayName, nonce);
+        let recoveredAddress = "";
+        try {
+            recoveredAddress = ethers.verifyMessage(approvalMessage, signature).toLowerCase();
+        }
+        catch {
+            return reply.code(401).send({ error: "Invalid strategist-name signature" });
+        }
+
+        if (recoveredAddress !== address) {
+            return reply.code(403).send({ error: "Signature/address mismatch" });
+        }
+
+        playerProfileNonces.delete(address);
     }
-    const approvalMessage = buildPlayerNameApprovalMessage(address, displayName, parsed.data.nonce);
-    let recoveredAddress = "";
-    try {
-        recoveredAddress = ethers.verifyMessage(approvalMessage, parsed.data.signature).toLowerCase();
+    else {
+        const rawSessionHeader = request.headers["x-wallet-session-address"];
+        const forwardedSessionAddress = normalizeAddressByChain(
+            Array.isArray(rawSessionHeader) ? rawSessionHeader[0] : rawSessionHeader,
+            chainType,
+        );
+        const sessionAddress = forwardedSessionAddress?.toLowerCase() ?? null;
+        if (!sessionAddress || sessionAddress !== address) {
+            return reply.code(403).send({ error: "Session/address mismatch" });
+        }
+
+        const nonce = String(parsed.data.nonce ?? "").trim();
+        const signature = normalizeAltSignature(parsed.data.signature);
+
+        if (nonce && signature) {
+            const nonceState = playerProfileNonces.get(address);
+            if (!nonceState || nonceState.expiresAt < Date.now() || nonceState.nonce !== nonce) {
+                return reply.code(401).send({ error: "Strategist-name approval expired. Please sign again." });
+            }
+
+            const chainId = resolveAltTypedDataChainId(chainConfig.networkKey);
+            void buildAltPlayerNameApprovalTypedData(address, displayName, nonce, chainId);
+            return reply.code(400).send({ error: "Typed-data signature verification is unavailable for this profile" });
+        }
     }
-    catch {
-        return reply.code(401).send({ error: "Invalid player-name signature" });
-    }
-    if (recoveredAddress !== address) {
-        return reply.code(403).send({ error: "Signature/address mismatch" });
-    }
-    playerProfileNonces.delete(address);
+
     try {
         const saved = await upsertPlayerProfile({
             address,
@@ -2035,7 +2217,7 @@ server.post("/players/profile", async (request, reply) => {
             return reply.code(409).send({ error: "Display name is already taken" });
         }
         request.log.error(error);
-        return reply.code(500).send({ error: "Failed to save player profile" });
+        return reply.code(500).send({ error: "Failed to save strategist profile" });
     }
 });
 server.post("/errors/ingest", async (request, reply) => {
@@ -2050,14 +2232,14 @@ server.post("/errors/ingest", async (request, reply) => {
     const walletAddress = normalizeMaybeAddress(payload.walletAddress);
     const sessionAddress = normalizeMaybeAddress(payload.sessionAddress) ?? forwardedSessionAddress;
 
-    let resolvedPlayerDisplayName = String(payload.playerDisplayName ?? "").trim();
-    if (!resolvedPlayerDisplayName) {
+    let resolvedStrategistDisplayName = String(payload.strategistDisplayName ?? "").trim();
+    if (!resolvedStrategistDisplayName) {
         const profileCandidates = Array.from(new Set([walletAddress, sessionAddress].filter(Boolean)));
         for (const candidate of profileCandidates) {
             const profile = await getPlayerProfile(String(candidate));
             const displayName = String(profile?.display_name ?? "").trim();
             if (displayName) {
-                resolvedPlayerDisplayName = displayName;
+                resolvedStrategistDisplayName = displayName;
                 break;
             }
         }
@@ -2080,7 +2262,7 @@ server.post("/errors/ingest", async (request, reply) => {
         release: payload.release ?? null,
         session_address: sessionAddress,
         wallet_address: walletAddress,
-        player_display_name: resolvedPlayerDisplayName || null,
+        strategist_display_name: resolvedStrategistDisplayName || null,
         user_agent: (payload.userAgent ?? String(request.headers["user-agent"] ?? "")).slice(0, 1024),
         ip_address: resolveClientIp(request),
         created_at: nowIso,
@@ -2094,19 +2276,19 @@ server.post("/errors/ingest", async (request, reply) => {
 server.post("/faucet", async (request, reply) => {
     const body = z.object({ address: z.string() }).parse(request.body);
     const rawAddress = body.address.trim();
-    let normalizedAddress;
-    try {
-        normalizedAddress = ethers.getAddress(rawAddress);
-    }
-    catch {
+    const chainConfig = await getRuntimeChainConfig();
+    const normalizedAddress = normalizeAddressByChain(rawAddress, chainConfig.chainType);
+    if (!normalizedAddress) {
         return reply.code(400).send({ error: "Invalid address" });
     }
+
     const address = normalizedAddress.toLowerCase();
     const amountRaw = env.FAUCET_STABLECOIN_AMOUNT;
     const cooldownHours = Number(env.FAUCET_COOLDOWN_HOURS || "24");
     const cooldownMs = cooldownHours * 60 * 60 * 1000;
     const now = Date.now();
     const previous = await getFaucetClaim(address);
+
     if (previous?.last_claim_at) {
         const lastMs = new Date(previous.last_claim_at).getTime();
         if (Number.isFinite(lastMs) && now - lastMs < cooldownMs) {
@@ -2118,53 +2300,34 @@ server.post("/faucet", async (request, reply) => {
             });
         }
     }
-    const [faucetMinterKey, chainConfig] = await Promise.all([
-        getRequiredRuntimeFaucetMinterPrivateKey(),
-        getRuntimeChainConfig(),
-    ]);
+
     if (!chainConfig.stablecoinAddress) {
         return reply.code(500).send({ error: "Stablecoin address not configured" });
     }
+
     const decimals = Number(chainConfig.stablecoinDecimals);
     if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
         throw new Error(`Invalid stablecoin decimals for runtime config: ${chainConfig.networkKey}`);
     }
+
     const amount = ethers.parseUnits(amountRaw, decimals);
+
     try {
-        const provider = await getRuntimeProvider();
-        const faucetWallet = new ethers.Wallet(faucetMinterKey, provider);
-        const stablecoinReadonly = new ethers.Contract(
+        const txHash = await mintStablecoinOnchain(
             chainConfig.stablecoinAddress,
-            ["function owner() view returns (address)", "function mint(address,uint256)"],
-            provider,
+            normalizedAddress,
+            amount,
         );
-        let stablecoinOwner: string | null = null;
-        try {
-            stablecoinOwner = ethers.getAddress(await stablecoinReadonly.owner());
-        }
-        catch {
-            stablecoinOwner = null;
-        }
-        if (stablecoinOwner && stablecoinOwner.toLowerCase() !== faucetWallet.address.toLowerCase()) {
-            throw new Error(
-                `FAUCET_MINTER_PRIVATE_KEY address ${faucetWallet.address} is not stablecoin owner ${stablecoinOwner}`
-            );
-        }
-        const stablecoin = stablecoinReadonly.connect(faucetWallet) as ethers.Contract;
-        await stablecoin.mint.estimateGas(normalizedAddress, amount);
-        const sent = await sendTxWithPolicy({
-            label: `faucetMint(${normalizedAddress})`,
-            signer: faucetWallet,
-            send: (overrides) => stablecoin.mint(normalizedAddress, amount, overrides),
-        });
+
         await upsertFaucetClaim({
             address,
             last_claim_at: new Date(now).toISOString(),
-            last_tx_hash: sent.txHash,
+            last_tx_hash: txHash,
         });
+
         return {
             ok: true,
-            txHash: sent.txHash,
+            txHash,
             amount: amountRaw,
             mintedTo: normalizedAddress,
             networkKey: chainConfig.networkKey,
@@ -2181,14 +2344,7 @@ server.post("/lineups", async (_request, reply) => {
         error: "Direct lineup writes are disabled. Use /lineups/intents then /lineups/intents/:intentId/submit.",
     });
 });
-const normalizeLowerAddress = (rawAddress: string) => {
-    try {
-        return ethers.getAddress(String(rawAddress ?? "").trim()).toLowerCase();
-    }
-    catch {
-        return null;
-    }
-};
+const normalizeLowerAddress = (rawAddress: string) => normalizeAddressByChain(String(rawAddress ?? "").trim());
 const normalizeIntentSlots = (slots: Array<{ slotId: string; coinId: string }>) => slots.map((slot) => ({
     slotId: String(slot.slotId ?? "").trim(),
     coinId: String(slot.coinId ?? "").trim(),
@@ -2270,6 +2426,45 @@ server.post("/lineups/intents", async (request, reply) => {
         request.log.error(error);
         return reply.code(500).send({ error: "Failed to create lineup intent" });
     }
+});
+server.post("/lineups/intents/:intentId/cancel", async (request, reply) => {
+    const params = z.object({ intentId: z.string().min(8) }).safeParse(request.params);
+    if (!params.success) {
+        return reply.code(400).send({ error: "Invalid intent id" });
+    }
+    const parsed = LineupIntentCancelSchema.safeParse(request.body);
+    if (!parsed.success) {
+        return reply.code(400).send({ error: "Invalid lineup intent cancel payload" });
+    }
+    const normalizedAddress = normalizeLowerAddress(parsed.data.address);
+    if (!normalizedAddress) {
+        return reply.code(400).send({ error: "Invalid address" });
+    }
+    const intentId = params.data.intentId.trim();
+    const intent = await getLineupTxIntentById(intentId);
+    if (!intent) {
+        return reply.code(404).send({ error: "Lineup intent not found" });
+    }
+    if (String(intent.address ?? "").toLowerCase() !== normalizedAddress) {
+        return reply.code(403).send({ error: "Intent/address mismatch" });
+    }
+    if (String(intent.status ?? "") === "completed") {
+        return reply.code(409).send({ error: "Completed intent cannot be canceled" });
+    }
+    const reason = String(parsed.data.reason ?? "").trim() || "intent canceled by client";
+    const updated = await markLineupTxIntentFailed(intentId, reason);
+    if (!updated) {
+        return reply.code(409).send({ error: "Lineup intent could not be canceled" });
+    }
+    return {
+        ok: true,
+        intent: {
+            id: updated.id,
+            status: updated.status,
+            lastError: updated.last_error ?? null,
+            resolvedAt: updated.resolved_at ?? null,
+        },
+    };
 });
 server.post("/lineups/intents/:intentId/submit", async (request, reply) => {
     const params = z.object({ intentId: z.string().min(8) }).safeParse(request.params);
@@ -2458,98 +2653,88 @@ server.get("/prices/live", async () => {
     const prices = await getLivePrices(symbols);
     return prices;
 });
-server.get("/weeks/:weekId/leaderboard", async (request) => {
-    const params = z.object({ weekId: z.string() }).parse(request.params);
-    try {
-        const week = await getWeekById(params.weekId);
-        if (week?.status === "ACTIVE") {
-            const lineups = await getLineups(params.weekId);
-            if (!lineups.length) {
-                return [];
-            }
-            const playerProfiles = await getPlayerProfilesByAddresses(lineups.map((lineup) => lineup.address));
-            const displayNameByAddress = new Map(playerProfiles.map((profile) => [
-                String(profile.address ?? "").toLowerCase(),
-                profile.display_name,
-            ]));
-            const weekCoins = await getWeekCoins(params.weekId);
-            const allCoins = await getCoins();
-            const coinMap = new Map(allCoins.map((coin) => [coin.id, coin]));
-            const weekCoinMap = new Map(weekCoins.map((row) => [row.coin_id, row]));
-            const weeklyPrices = await getWeeklyCoinPrices(params.weekId);
-            const startPriceBySymbol = new Map(weeklyPrices
-                .filter((row) => row.start_price !== null)
-                .map((row) => [row.symbol.toUpperCase(), Number(row.start_price)]));
-            const universeSymbols = weekCoins
-                .map((weekCoin) => coinMap.get(weekCoin.coin_id)?.symbol?.toUpperCase() ?? "")
-                .filter(Boolean);
-            const livePrices = universeSymbols.length ? await getLivePrices(universeSymbols) : {};
-            const markPriceBySymbol = new Map(Object.entries(livePrices)
-                .map(([symbol, value]) => [symbol.toUpperCase(), Number(value)])
-                .filter(([, value]) => Number.isFinite(value as number) && (value as number) > 0) as [string, number][]);
-            const benchmarkPnlPercent = computeBenchmarkPnlPercent(universeSymbols, startPriceBySymbol, markPriceBySymbol);
-            const rows = [];
-            for (const lineup of lineups) {
-                try {
-                    const slots = JSON.parse(lineup.slots_json);
-                    if (!Array.isArray(slots) || !slots.length) {
-                        continue;
-                    }
-                    const lineupId = `${params.weekId}-${String(lineup.address ?? "").toLowerCase()}`;
-                    const lineupPositions = await getLineupPositions(lineupId);
-                    const score = calculateLineupWeekScore({
-                        slots,
-                        lineupPositions,
-                        coinById: coinMap,
-                        weekCoinById: weekCoinMap,
-                        startPriceBySymbol,
-                        markPriceBySymbol,
-                        benchmarkPnlPercent,
-                    });
-                    rows.push({
-                        week_id: params.weekId,
-                        lineup_id: lineupId,
-                        address: lineup.address,
-                        raw_performance: score.rawPerformance,
-                        efficiency_multiplier: score.efficiencyMultiplier,
-                        final_score: score.finalScore,
-                        reward_amount_wei: null,
-                        created_at: lineup.created_at,
-                        deposit_wei: lineup.deposit_wei ?? "0",
-                        principal_wei: lineup.principal_wei ?? "0",
-                        risk_wei: lineup.risk_wei ?? "0",
-                        swaps: Number(lineup.swaps ?? 0),
-                        display_name: displayNameByAddress.get(String(lineup.address ?? "").toLowerCase()) ?? null,
-                    });
-                }
-                catch {
-                    continue;
-                }
-            }
-            rows.sort((a, b) => {
-                if (b.final_score !== a.final_score)
-                    return b.final_score - a.final_score;
-                return String(a.address).localeCompare(String(b.address));
-            });
-            return rows.map((row, index) => ({ ...row, rank: index + 1 }));
-        }
-        const rows = await getLeaderboardRows(params.weekId);
-        return rows;
+server.get("/strategies/:strategyId", async (request, reply) => {
+    const params = z.object({ strategyId: z.string().trim().min(1) }).parse(request.params);
+    const strategy = await getStrategyById(params.strategyId);
+    if (!strategy) {
+        return reply.code(404).send({ error: "Strategy not found" });
     }
-    catch (error) {
-        return [];
-    }
+    const [recentEpochs, recentSeasons] = await Promise.all([
+        getStrategyEpochEntries(params.strategyId, 24),
+        getStrategySeasonEntries(params.strategyId, 6),
+    ]);
+    return {
+        ...strategy,
+        recentEpochs,
+        recentSeasons,
+    };
 });
-const fetchAllTimeLeaderboard = async () => {
-    try {
-        return await getAllWeeklyResults();
-    }
-    catch {
-        return [];
-    }
-};
-server.get("/leaderboard/all-time", async () => fetchAllTimeLeaderboard());
-server.get("/leaderboard/all_time", async () => fetchAllTimeLeaderboard());
+
+server.get("/epochs/:epochId/strategies", async (request) => {
+    const params = z.object({ epochId: z.string().trim().min(1) }).parse(request.params);
+    const query = z.object({
+        page: z.coerce.number().int().min(1).max(100000).default(1),
+        pageSize: z.coerce.number().int().min(1).max(100).default(50),
+    }).parse(request.query ?? {});
+
+    const page = Math.max(1, query.page);
+    const pageSize = Math.max(1, Math.min(100, query.pageSize));
+    const offset = (page - 1) * pageSize;
+    const result = await getEpochStrategies(params.epochId, { limit: pageSize, offset });
+    const totalPages = Math.max(1, Math.ceil(result.total / pageSize));
+
+    return {
+        epochId: params.epochId,
+        page,
+        pageSize,
+        total: result.total,
+        totalPages,
+        rows: result.rows,
+    };
+});
+
+server.get("/leaderboard/strategies", async (request) => {
+    const query = z.object({
+        epochId: z.string().trim().optional(),
+        scope: z.enum(["all_time", "season"]).optional(),
+        seasonId: z.string().trim().max(40).optional(),
+        page: z.coerce.number().int().min(1).max(100000).default(1),
+        pageSize: z.coerce.number().int().min(1).max(100).default(50),
+    }).parse(request.query ?? {});
+
+    const page = Math.max(1, query.page);
+    const pageSize = Math.max(1, Math.min(100, query.pageSize));
+    const offset = (page - 1) * pageSize;
+    const epochId = String(query.epochId ?? "").trim();
+    const scope = query.scope ?? "all_time";
+    const seasonId = String(query.seasonId ?? "").trim();
+
+    const result = await getStrategyLeaderboardRows({
+        epochId,
+        scope,
+        seasonId,
+        limit: pageSize,
+        offset,
+    });
+    const totalPages = Math.max(1, Math.ceil(result.total / pageSize));
+
+    const resolvedSeasonId =
+        scope === "season"
+            ? (("seasonId" in result ? result.seasonId : seasonId) || null)
+            : null;
+
+    return {
+        epochId: epochId || null,
+        scope,
+        seasonId: resolvedSeasonId,
+        page,
+        pageSize,
+        total: result.total,
+        totalPages,
+        rows: result.rows,
+    };
+});
+
 server.get("/weeks/:weekId/results/:address", async (request, reply) => {
     const params = z
         .object({ weekId: z.string(), address: z.string() })
@@ -2567,10 +2752,6 @@ server.get("/weeks/:weekId/results/:address", async (request, reply) => {
         return reply.code(404).send({ error: "Result not found" });
     }
 });
-server.get("/admin/gcloud/usage", async (_request, reply) => {
-    return reply.code(404).send({ error: "GCloud usage endpoint disabled for this deployment" });
-});
-
 server.get("/admin/errors/summary", async (request) => {
     const query = ErrorSummaryQuerySchema.parse(request.query ?? {});
     const summary = await getErrorEventsSummary(query.windowHours);
@@ -2591,6 +2772,8 @@ server.get("/admin/errors", async (request) => {
         source: query.source,
         category: query.category,
         acknowledged: query.ack ?? "all",
+        actionable: query.actionable ?? "all",
+        incidentState: query.incidentState,
         search: query.q,
     });
     const totalPages = Math.max(1, Math.ceil(result.total / pageSize));
@@ -2601,6 +2784,31 @@ server.get("/admin/errors", async (request) => {
         totalPages,
         rows: result.rows,
     };
+});
+server.get("/admin/errors/:id", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const id = Number(params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+        return reply.code(400).send({ error: "Invalid error id" });
+    }
+    const row = await getErrorEventById(id);
+    if (!row) {
+        return reply.code(404).send({ error: "Error event not found" });
+    }
+    return row;
+});
+server.post("/admin/errors/:id/ack", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const body = z.object({ acknowledgedBy: z.string().trim().max(120).optional() }).parse(request.body ?? {});
+    const id = Number(params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+        return reply.code(400).send({ error: "Invalid error id" });
+    }
+    const result = await acknowledgeErrorEvent(id, body.acknowledgedBy ?? "ops-console");
+    if (!result) {
+        return reply.code(404).send({ error: "Error event not found" });
+    }
+    return { ok: true, row: result.row, affected: result.affected, mode: result.mode };
 });
 server.get("/admin/errors/incidents/summary", async (request) => {
     const query = ErrorSummaryQuerySchema.parse(request.query ?? {});
@@ -2640,30 +2848,66 @@ server.post("/admin/errors/incidents/:id/state", async (request, reply) => {
     }
     return { ok: true, row };
 });
-server.get("/admin/errors/:id", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const id = Number(params.id);
-    if (!Number.isFinite(id) || id <= 0) {
-        return reply.code(400).send({ error: "Invalid error id" });
-    }
-    const row = await getErrorEventById(id);
-    if (!row) {
-        return reply.code(404).send({ error: "Error event not found" });
-    }
-    return row;
+server.get("/admin/errors/suppress-rules", async () => {
+    const rows = await listErrorSuppressRules();
+    return { rows };
 });
-server.post("/admin/errors/:id/ack", async (request, reply) => {
+server.post("/admin/errors/suppress-rules", async (request, reply) => {
+    const body = ErrorSuppressRuleInputSchema.parse(request.body ?? {});
+    const row = await createErrorSuppressRule({
+        name: body.name,
+        enabled: body.enabled === undefined ? 1 : (body.enabled === true || body.enabled === 1 ? 1 : 0),
+        source: body.source || null,
+        category: body.category || null,
+        fingerprint: body.fingerprint || null,
+        path_pattern: body.pathPattern || null,
+        method: body.method || null,
+        status_code: body.statusCode ?? null,
+        message_pattern: body.messagePattern || null,
+        severity: body.severity || null,
+        notes: body.notes || null,
+    });
+    if (!row) {
+        return reply.code(500).send({ error: "Failed to create rule" });
+    }
+    return { ok: true, row };
+});
+server.patch("/admin/errors/suppress-rules/:id", async (request, reply) => {
     const params = z.object({ id: z.string() }).parse(request.params);
-    const body = z.object({ acknowledgedBy: z.string().trim().max(120).optional() }).parse(request.body ?? {});
+    const body = ErrorSuppressRulePatchSchema.parse(request.body ?? {});
     const id = Number(params.id);
     if (!Number.isFinite(id) || id <= 0) {
-        return reply.code(400).send({ error: "Invalid error id" });
+        return reply.code(400).send({ error: "Invalid rule id" });
     }
-    const result = await acknowledgeErrorEvent(id, body.acknowledgedBy ?? "ops-console");
-    if (!result) {
-        return reply.code(404).send({ error: "Error event not found" });
+    const row = await updateErrorSuppressRule(id, {
+        name: body.name ?? null,
+        enabled: body.enabled === undefined ? null : (body.enabled === true || body.enabled === 1 ? 1 : 0),
+        source: body.source ?? null,
+        category: body.category ?? null,
+        fingerprint: body.fingerprint ?? null,
+        path_pattern: body.pathPattern ?? null,
+        method: body.method ?? null,
+        status_code: body.statusCode ?? null,
+        message_pattern: body.messagePattern ?? null,
+        severity: body.severity ?? null,
+        notes: body.notes ?? null,
+    });
+    if (!row) {
+        return reply.code(404).send({ error: "Rule not found" });
     }
-    return { ok: true, row: result.row, affected: result.affected, mode: result.mode };
+    return { ok: true, row };
+});
+server.delete("/admin/errors/suppress-rules/:id", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const id = Number(params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+        return reply.code(400).send({ error: "Invalid rule id" });
+    }
+    const row = await deleteErrorSuppressRule(id);
+    if (!row) {
+        return reply.code(404).send({ error: "Rule not found" });
+    }
+    return { ok: true, row };
 });
 server.get("/admin/status", async () => {
     const weeks = await getWeeks();
@@ -2739,16 +2983,9 @@ server.post("/admin/automation/failover/reset", async (request, reply) => {
     if (!isAdminAuthorized(request)) {
         return reply.code(401).send({ error: "Unauthorized" });
     }
-    try {
-        return reply.code(409).send({
-            error: "Automation halt reset is disabled in strict mode. Change env + redeploy to recover.",
-        });
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        server.log.error({ error }, "automation halt reset endpoint failed");
-        return reply.code(500).send({ error: message });
-    }
+    return reply.code(409).send({
+        error: "Automation halt reset is disabled in strict mode. Change env + redeploy to recover.",
+    });
 });
 server.get("/admin/finance/week", async (request, reply) => {
     const query = z.object({ weekId: z.string().optional() }).parse(request.query ?? {});
@@ -3107,6 +3344,29 @@ const AUTOMATION_GUARDED_JOB_NAMES = new Set([
     "finalize",
     "finalize-audit",
 ]);
+const maybeRecoverAutomationFailureFromDrift = async (jobName: string, status: Record<string, unknown>) => {
+    const weekId = String((status as { weekId?: string | null }).weekId ?? "").trim();
+    const latestWeeks = await getWeeks();
+    const current = weekId ? (await getWeekById(weekId)) ?? latestWeeks[0] : latestWeeks[0];
+    if (!current) {
+        return false;
+    }
+    const dbStatus = String(current.status ?? "").toUpperCase();
+    if (!["DRAFT_OPEN", "LOCKED", "ACTIVE", "FINALIZE_PENDING", "FINALIZED"].includes(dbStatus)) {
+        return false;
+    }
+    const leagueAddress = await getRuntimeValcoreAddress().catch(() => null);
+    if (!leagueAddress) {
+        return false;
+    }
+    const drift = await reconcileWeekStatusDrift({
+        context: `automation-failure/${jobName}`,
+        weekId: String(current.id),
+        dbStatus,
+        leagueAddress,
+    });
+    return drift.reconciled;
+};
 const maybeEscalateAutomationFailure = async (event: { name?: string; status?: Record<string, unknown> } | null | undefined) => {
     const jobName = String(event?.name ?? "");
     if (!AUTOMATION_GUARDED_JOB_NAMES.has(jobName))
@@ -3115,6 +3375,10 @@ const maybeEscalateAutomationFailure = async (event: { name?: string; status?: R
     const state = String((status as { state?: string }).state ?? "").toLowerCase();
     const nextRetryAt = String((status as { nextRetryAt?: string | null }).nextRetryAt ?? "").trim();
     if (state !== "error" || nextRetryAt) {
+        return;
+    }
+    const recovered = await maybeRecoverAutomationFailureFromDrift(jobName, status as Record<string, unknown>).catch(() => false);
+    if (recovered) {
         return;
     }
     const runtime = await resolveAutomationRuntime();
@@ -3209,14 +3473,30 @@ const runAutomationTick = async () => {
             return;
         }
         const weeks = await getWeeks();
-        const current = weeks[0];
+        let current = weeks[0];
         if (!current) {
             await startAutomationJob("run-week", ["run", "job:week"]);
             return;
         }
+        const leagueAddress = await getRuntimeValcoreAddress().catch(() => null);
+        if (leagueAddress) {
+            const drift = await reconcileWeekStatusDrift({
+                context: "automation-tick",
+                weekId: current.id,
+                dbStatus: String(current.status ?? ""),
+                leagueAddress,
+            });
+            if (drift.reconciled) {
+                const refreshed = await getWeekById(String(current.id));
+                if (refreshed) {
+                    current = refreshed;
+                }
+            }
+        }
         const status = String(current.status ?? "").toUpperCase();
         const nowMs = Date.now();
         const createdAtMs = Date.parse(String(current.created_at ?? ""));
+        const startAtMs = Date.parse(String(current.start_at ?? ""));
         const lockAtMs = Date.parse(String(current.lock_at ?? ""));
         const endAtMs = Date.parse(String(current.end_at ?? ""));
         const finalizedAtMs = Date.parse(String(current.finalized_at ?? ""));
@@ -3245,7 +3525,8 @@ const runAutomationTick = async () => {
             const hasSentinelKey = String(env.SENTINEL_PRIVATE_KEY ?? "").trim().length > 0;
             const hasSentinelAccount = String(env.SENTINEL_ACCOUNT_ADDRESS ?? "").trim().length > 0;
             const canAutoCommitSentinel =
-                (runtimeChainType === "evm" && hasSentinelKey);
+                (runtimeChainType === "evm" && hasSentinelKey) ||
+                (runtimeChainType !== "evm" && hasSentinelKey && hasSentinelAccount);
             const draftWindowElapsed = Number.isFinite(lockAtMs) && nowMs >= lockAtMs;
 
             if (lineups.length === 0 && canAutoCommitSentinel) {
@@ -3265,61 +3546,29 @@ const runAutomationTick = async () => {
                 }
                 return;
             }
-
-            if (draftWindowElapsed) {
-                if (isReactiveMode && nowMs >= lockAtMs + REACTIVE_STALL_GRACE_MS) {
-                    await haltAutomation("Reactive lock transition missed deadline", {
-                        weekId: current.id,
-                        status,
-                        lockAt: current.lock_at,
-                        nowMs,
-                        graceMs: REACTIVE_STALL_GRACE_MS,
-                    });
-                }
-                await startAutomationJob("transition-lock", ["run", "job:transition", "--", "lock"]);
+        if (draftWindowElapsed) {
+            await startAutomationJob("transition-lock", ["run", "job:transition", "--", "lock"]);
+            return;
+        }
+            if (isReactiveMode)
                 return;
-            }
-
-            if (isReactiveMode) {
-                return;
-            }
             return;
         }
         if (status === "LOCKED") {
-            if (isReactiveMode) {
-                if (Number.isFinite(lockAtMs) && nowMs >= lockAtMs + REACTIVE_STALL_GRACE_MS) {
-                    await haltAutomation("Reactive start transition missed deadline", {
-                        weekId: current.id,
-                        status,
-                        lockAt: current.lock_at,
-                        nowMs,
-                        graceMs: REACTIVE_STALL_GRACE_MS,
-                    });
-                    await startAutomationJob("transition-start", ["run", "job:transition", "--", "start"]);
-                }
+            const startBaselineMs = Number.isFinite(startAtMs) ? startAtMs : lockAtMs;
+            if (Number.isFinite(startBaselineMs) && nowMs < startBaselineMs) {
                 return;
             }
             await startAutomationJob("transition-start", ["run", "job:transition", "--", "start"]);
             return;
         }
         if (status === "ACTIVE") {
-            if (isReactiveMode) {
-                if (Number.isFinite(endAtMs) && nowMs >= endAtMs + REACTIVE_STALL_GRACE_MS) {
-                    await haltAutomation("Reactive finalize transition missed deadline", {
-                        weekId: current.id,
-                        status,
-                        endAt: current.end_at,
-                        nowMs,
-                        graceMs: REACTIVE_STALL_GRACE_MS,
-                    });
-                    await startAutomationJob("finalize", ["run", "job:finalize"]);
-                }
-                return;
-            }
-
             if (Number.isFinite(endAtMs) && nowMs >= endAtMs) {
                 await startAutomationJob("finalize", ["run", "job:finalize"]);
+                return;
             }
+            if (isReactiveMode)
+                return;
             return;
         }
         if (status === "FINALIZE_PENDING") {
@@ -3343,7 +3592,7 @@ const runAutomationTick = async () => {
         }
     }
     catch (error) {
-        server.log.error({ error }, "runAutomationTick failed");
+        server.log.error({ err: error }, "runAutomationTick failed");
     }
     finally {
         automationTickRunning = false;
@@ -3362,7 +3611,7 @@ const runAutoMomentum = async () => {
     const current = weeks[0];
     if (!current || current.status === "FINALIZED" || current.status === "FINALIZE_PENDING")
         return;
-    await startJob("momentum-live", "npm", ["run", "job:momentum-live"]);
+    await startJob("momentum-live", "node", ["dist/jobs/run-momentum-live.js"]);
 };
 setInterval(() => {
     void runAutoMomentum().catch((error) => {
@@ -3399,6 +3648,16 @@ startSelfHealWorker();
 void runSelfHealSweep().catch((error) => {
     server.log.error({ error }, "runSelfHealSweep bootstrap failed");
 });
+setInterval(() => {
+    void (async () => {
+        const expired = await expireStalePreparedLineupTxIntents(PREPARED_INTENT_EXPIRE_SECONDS);
+        if (Array.isArray(expired) && expired.length > 0) {
+            server.log.warn({ count: expired.length }, "expired stale prepared lineup intents");
+        }
+    })().catch((error) => {
+        server.log.error({ error }, "expireStalePreparedLineupTxIntents failed");
+    });
+}, PREPARED_INTENT_SWEEP_MS);
 const MOCK_SCORE_SNAPSHOT_INTERVAL_MS = Math.max(600000, Number(env.MOCK_SCORE_SNAPSHOT_INTERVAL_MS || "600000") || 600000);
 let mockScoreSnapshotTickRunning = false;
 const runMockScoreSnapshotTick = async () => {
@@ -3421,8 +3680,22 @@ setInterval(() => {
     void runMockScoreSnapshotTick();
 }, MOCK_SCORE_SNAPSHOT_INTERVAL_MS);
 void runMockScoreSnapshotTick();
-const port = Number(env.ORACLE_PORT || "3101");
+const port = Number(env.ORACLE_PORT || process.env.PORT || "3101");
 server.listen({ port, host: "0.0.0.0" });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

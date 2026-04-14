@@ -1,8 +1,9 @@
-﻿import { env } from "../env.js";
+import { env } from "../env.js";
 import {
   clearAllMockLineups,
   clearMockScoreAggregates,
   countCompletedLifecycleIntents,
+  getWeekById,
   getWeeks,
   getLineups,
   updateWeekStatus,
@@ -24,6 +25,7 @@ import {
   markLifecycleIntentSubmitted,
 } from "./lifecycle-intent.js";
 import { queryWrite } from "../db/db.js";
+import { reconcileWeekStatusDrift } from "./week-drift.js";
 
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
 const action = args[0];
@@ -34,6 +36,65 @@ const START_WEEK_MOCK_LINEUP_COUNT = Math.max(
   1,
   Math.min(100, Number(env.START_WEEK_MOCK_LINEUP_COUNT ?? "100") || 100),
 );
+const ONCHAIN_READ_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.ONCHAIN_READ_TIMEOUT_MS ?? "15000") || 15000,
+);
+const ONCHAIN_READ_RETRY_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.ONCHAIN_READ_RETRY_ATTEMPTS ?? "3") || 3,
+);
+const ONCHAIN_READ_RETRY_DELAY_MS = Math.max(
+  250,
+  Number(process.env.ONCHAIN_READ_RETRY_DELAY_MS ?? "1200") || 1200,
+);
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  return await new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+};
+
+const readOnchainWeekState = async (leagueAddress: string, weekId: bigint, context: string) => {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= ONCHAIN_READ_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await withTimeout(
+        getOnchainWeekState(leagueAddress, weekId),
+        ONCHAIN_READ_TIMEOUT_MS,
+        `${context}: getOnchainWeekState`,
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt < ONCHAIN_READ_RETRY_ATTEMPTS) {
+        await sleep(ONCHAIN_READ_RETRY_DELAY_MS);
+      }
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown");
+  throw new Error(`${context}: getOnchainWeekState failed after ${ONCHAIN_READ_RETRY_ATTEMPTS} attempt(s): ${message}`);
+};
+
+const readOnchainTestMode = async (leagueAddress: string, context: string) => {
+  return await withTimeout(
+    getOnchainTestMode(leagueAddress),
+    ONCHAIN_READ_TIMEOUT_MS,
+    `${context}: getOnchainTestMode`,
+  );
+};
 
 const ensureWeekStatusWritten = async (weekId: string, expectedStatus: string, context: string) => {
   const rows = await queryWrite<{ status: string }>("SELECT status FROM weeks WHERE id = $1", [weekId]);
@@ -86,13 +147,8 @@ const run = async () => {
   }
 
   const weeks = await getWeeks();
-  const week = weeks[0];
+  let week = weeks[0];
   if (!week) throw new Error("No week found");
-
-  const requiredDbStatus = action === "lock" ? "DRAFT_OPEN" : "LOCKED";
-  if (String(week.status ?? "").toUpperCase() !== requiredDbStatus) {
-    throw new Error(`transition(${action}) requires ${requiredDbStatus} week; got ${String(week.status ?? "UNKNOWN")}`);
-  }
 
   const chainEnabled = isValcoreChainEnabled();
   const chainConfig = chainEnabled ? await getRuntimeChainConfig().catch(() => null) : null;
@@ -100,6 +156,30 @@ const run = async () => {
   const isReactiveEvm = automationMode === "REACTIVE" && runtimeChainType === "evm";
   const supportsSentinelAutoCommit = runtimeChainType === "evm";
   const leagueAddress = chainEnabled ? await getRuntimeValcoreAddress() : null;
+
+  const requiredDbStatus = action === "lock" ? "DRAFT_OPEN" : "LOCKED";
+  if (chainEnabled && leagueAddress) {
+    const drift = await reconcileWeekStatusDrift({
+      context: `run-transition/${action}`,
+      weekId: week.id,
+      dbStatus: String(week.status ?? ""),
+      leagueAddress,
+    });
+    if (drift.reconciled) {
+      week = (await getWeekById(String(week.id))) ?? week;
+      const refreshedStatus = String(week.status ?? "").toUpperCase();
+      if (refreshedStatus !== requiredDbStatus) {
+        console.log(
+          `transition(${action}) skipped after drift reconcile: week ${week.id} status is ${refreshedStatus} (requires ${requiredDbStatus})`,
+        );
+        return;
+      }
+    }
+  }
+
+  if (String(week.status ?? "").toUpperCase() !== requiredDbStatus) {
+    throw new Error(`transition(${action}) requires ${requiredDbStatus} week; got ${String(week.status ?? "UNKNOWN")}`);
+  }
 
   if (action === "lock") {
     const lockAtMs = Date.parse(String(week.lock_at ?? ""));
@@ -149,7 +229,7 @@ const run = async () => {
   let alreadyTransitionedOnchain = false;
 
   if (chainEnabled && leagueAddress) {
-    const onchainPre = await getOnchainWeekState(leagueAddress, BigInt(week.id));
+    const onchainPre = await readOnchainWeekState(leagueAddress, BigInt(week.id), `run-transition/${action}/pre`);
     const onchainStatusPre = Number(onchainPre.status ?? 0);
 
     if (onchainStatusPre === expectedOnchainStatusAfter) {
@@ -167,7 +247,7 @@ const run = async () => {
   if (action === "lock" && chainEnabled && leagueAddress && supportsSentinelAutoCommit && !alreadyTransitionedOnchain) {
     const lockAtMs = Date.parse(String(week.lock_at ?? ""));
     const draftWindowOpen = !Number.isFinite(lockAtMs) || Date.now() < lockAtMs;
-    let onchainWeek = await getOnchainWeekState(leagueAddress, BigInt(week.id));
+    let onchainWeek = await readOnchainWeekState(leagueAddress, BigInt(week.id), "run-transition/lock/risk-precheck");
     if (Number(onchainWeek.status ?? 0) !== 1 || BigInt(onchainWeek.riskCommitted ?? 0n) <= 0n) {
       if (isManual) {
         throw new Error("DETERMINISTIC: cannot lock week because on-chain committed risk is zero");
@@ -180,7 +260,11 @@ const run = async () => {
         console.warn(`transition(lock): sentinel on-chain heal skipped reason=${sentinelResult.reason}`);
       }
 
-      onchainWeek = await getOnchainWeekState(leagueAddress, BigInt(week.id));
+      onchainWeek = await readOnchainWeekState(
+        leagueAddress,
+        BigInt(week.id),
+        "run-transition/lock/risk-post-sentinel",
+      );
       if (Number(onchainWeek.status ?? 0) !== 1 || BigInt(onchainWeek.riskCommitted ?? 0n) <= 0n) {
         if (!draftWindowOpen) {
           throw new Error(
@@ -218,9 +302,23 @@ const run = async () => {
   let txHash: string | null = intent.tx_hash ? String(intent.tx_hash).toLowerCase() : null;
   let reactiveTxHash: string | null = isReactiveEvm ? txHash : null;
 
+  // If a previous failed attempt left a tx hash but on-chain state did not move,
+  // clear the stale hash and retry by submitting a fresh transition tx.
+  if (txHash && chainEnabled && leagueAddress && !alreadyTransitionedOnchain) {
+    const intentState = String(intent.status ?? "").toLowerCase();
+    if (intentState === "failed" || intentState === "error") {
+      const onchainNow = await getOnchainWeekState(leagueAddress, BigInt(week.id));
+      const onchainNowStatus = Number(onchainNow.status ?? 0);
+      if (onchainNowStatus === expectedOnchainStatusBefore) {
+        txHash = null;
+        reactiveTxHash = null;
+      }
+    }
+  }
+
   try {
     if (!txHash && leagueAddress && !alreadyTransitionedOnchain) {
-      const onchainTestMode = await getOnchainTestMode(leagueAddress);
+      const onchainTestMode = await readOnchainTestMode(leagueAddress, `run-transition/${action}`);
       const useForce = isManual || onchainTestMode;
       if (Boolean(onchainTestMode) !== isManual) {
         console.warn(
@@ -292,7 +390,7 @@ const run = async () => {
     }
 
     if (chainEnabled && leagueAddress && !alreadyTransitionedOnchain) {
-      const onchainAfter = await getOnchainWeekState(leagueAddress, BigInt(week.id));
+      const onchainAfter = await readOnchainWeekState(leagueAddress, BigInt(week.id), `run-transition/${action}/post`);
       const onchainAfterStatus = Number(onchainAfter.status ?? 0);
       if (onchainAfterStatus !== expectedOnchainStatusAfter) {
         if (isReactiveEvm && txHash) {
@@ -359,13 +457,5 @@ run().then(() => {
   console.error("Transition job failed:", error);
   process.exit(1);
 });
-
-
-
-
-
-
-
-
 
 

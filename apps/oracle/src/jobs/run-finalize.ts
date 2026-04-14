@@ -4,6 +4,7 @@ import {
   finalizeActivePositionsAtWeekEnd,
   getLineupPositions,
   getWeeklyCoinPrices,
+  snapshotWeekStartPrices,
   snapshotWeekEndPrices,
 } from "../services/weekPricing.service.js";
 import {
@@ -75,12 +76,27 @@ const run = async () => {
 
   let weeklyPrices = await getWeeklyCoinPrices(week.id);
   if (!weeklyPrices.length) {
-    throw new Error("Missing weekly coin prices");
+    const lockAtTs = Math.floor(new Date(week.lock_at).getTime() / 1000);
+    if (Number.isFinite(lockAtTs) && lockAtTs > 0) {
+      await snapshotWeekStartPrices(week.id, { timestamp: lockAtTs });
+      weeklyPrices = await getWeeklyCoinPrices(week.id);
+    }
+    if (!weeklyPrices.length) {
+      throw new Error("Missing weekly coin prices");
+    }
   }
 
   const hasStartPrices = weeklyPrices.some((row) => row.start_price !== null);
   if (!hasStartPrices) {
-    throw new Error("Missing week start prices");
+    const lockAtTs = Math.floor(new Date(week.lock_at).getTime() / 1000);
+    if (Number.isFinite(lockAtTs) && lockAtTs > 0) {
+      await snapshotWeekStartPrices(week.id, { timestamp: lockAtTs });
+      weeklyPrices = await getWeeklyCoinPrices(week.id);
+    }
+    const hasRecoveredStartPrices = weeklyPrices.some((row) => row.start_price !== null);
+    if (!hasRecoveredStartPrices) {
+      throw new Error("Missing week start prices");
+    }
   }
 
   const hasEndPrices = weeklyPrices.some((row) => row.end_price !== null);

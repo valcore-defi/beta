@@ -114,6 +114,29 @@ type ReactiveTransportConfig = {
 let reactiveDispatcherPreflightCacheKey: string | null = null;
 let reactiveDispatcherResolvedSender: string | null = null;
 
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withRetry = async <T>(
+  fn: () => Promise<T>,
+  attempts: number,
+  retryDelayMs: number,
+  label: string,
+): Promise<T> => {
+  let lastError: unknown = null;
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (i < attempts) {
+        await wait(retryDelayMs);
+      }
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown error");
+  throw new Error(`${label} failed after ${attempts} attempts: ${message}`);
+};
+
 const getReactiveTransportConfig = async (): Promise<ReactiveTransportConfig | null> => {
   const mode = String(process.env.AUTOMATION_MODE_EFFECTIVE ?? env.AUTOMATION_MODE ?? "").trim().toUpperCase();
   if (mode !== "REACTIVE") return null;
@@ -149,73 +172,126 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
     config.receiverAddress.toLowerCase(),
     config.executorPrivateKey.toLowerCase(),
   ].join("|");
-  if (reactiveDispatcherPreflightCacheKey === cacheKey) return;
+  const cachedStaticPreflight = reactiveDispatcherPreflightCacheKey === cacheKey;
 
-  const reactiveProvider = new ethers.JsonRpcProvider(config.rpcUrl, config.chainId);
+  const reactiveProvider = new ethers.JsonRpcProvider(
+    config.rpcUrl,
+    { chainId: config.chainId, name: "reactive" },
+    { staticNetwork: true },
+  );
   const dispatcher = new ethers.Contract(config.dispatcherAddress, REACTIVE_DISPATCHER_ABI, reactiveProvider);
+  const preflightTimeoutMs = Math.max(3000, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_TIMEOUT_MS, 15000));
+  const preflightRetryAttempts = Math.max(1, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_RETRY_ATTEMPTS, 3));
+  const preflightRetryDelayMs = Math.max(250, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_RETRY_DELAY_MS, 1200));
 
-  const destinationProvider = await getRuntimeProvider();
-  const destinationNetwork = await destinationProvider.getNetwork();
-  const expectedDestinationChainId = BigInt(destinationNetwork.chainId);
-  const expectedDestinationReceiver = config.receiverAddress.toLowerCase();
-  const expectedOperator = new ethers.Wallet(config.executorPrivateKey).address.toLowerCase();
-
-  const [destinationChainId, destinationReceiver, operator] = await Promise.all([
-    dispatcher.destinationChainId(),
-    dispatcher.destinationReceiver(),
-    dispatcher.operator(),
-  ]);
-
-  if (BigInt(destinationChainId) !== expectedDestinationChainId) {
-    throw new Error(
-      `Reactive dispatcher destinationChainId mismatch: expected=${expectedDestinationChainId.toString()} got=${BigInt(destinationChainId).toString()}`,
+  if (!cachedStaticPreflight) {
+    const destinationProvider = await getRuntimeProvider();
+    const destinationNetwork = await withTimeout(
+      destinationProvider.getNetwork(),
+      preflightTimeoutMs,
+      "reactive preflight: destination.getNetwork",
     );
-  }
+    const expectedDestinationChainId = BigInt(destinationNetwork.chainId);
+    const expectedDestinationReceiver = config.receiverAddress.toLowerCase();
+    const expectedOperator = new ethers.Wallet(config.executorPrivateKey).address.toLowerCase();
 
-  if (String(destinationReceiver).toLowerCase() !== expectedDestinationReceiver) {
-    throw new Error(
-      `Reactive dispatcher destinationReceiver mismatch: expected=${expectedDestinationReceiver} got=${String(destinationReceiver).toLowerCase()}`,
+    const [destinationChainId, destinationReceiver, operator] = await withRetry(
+      () =>
+        Promise.all([
+          withTimeout(dispatcher.destinationChainId(), preflightTimeoutMs, "reactive preflight: dispatcher.destinationChainId"),
+          withTimeout(dispatcher.destinationReceiver(), preflightTimeoutMs, "reactive preflight: dispatcher.destinationReceiver"),
+          withTimeout(dispatcher.operator(), preflightTimeoutMs, "reactive preflight: dispatcher.operator"),
+        ]),
+      preflightRetryAttempts,
+      preflightRetryDelayMs,
+      "reactive preflight: dispatcher static reads",
     );
-  }
 
-  if (String(operator).toLowerCase() !== expectedOperator) {
-    throw new Error(
-      `Reactive dispatcher operator mismatch: expected=${expectedOperator} got=${String(operator).toLowerCase()}`,
-    );
-  }
+    if (BigInt(destinationChainId) !== expectedDestinationChainId) {
+      throw new Error(
+        `Reactive dispatcher destinationChainId mismatch: expected=${expectedDestinationChainId.toString()} got=${BigInt(destinationChainId).toString()}`,
+      );
+    }
 
-  const mapping = await reactiveProvider.send("rnk_getRnkAddressMapping", [config.dispatcherAddress]);
-  const mappedRvmIdRaw = String(
-    (mapping as { rvmId?: unknown; RvmId?: unknown } | null | undefined)?.rvmId ??
-      (mapping as { rvmId?: unknown; RvmId?: unknown } | null | undefined)?.RvmId ??
-      "",
-  ).trim();
-  if (!mappedRvmIdRaw) {
-    throw new Error("Reactive dispatcher RVM mapping is missing (rnk_getRnkAddressMapping)");
-  }
-  const expectedReactiveSender = ethers.getAddress(mappedRvmIdRaw).toLowerCase();
-  const receiver = new ethers.Contract(config.receiverAddress, REACTIVE_RECEIVER_VIEW_ABI, destinationProvider);
-  const configuredReactiveSender = String(await receiver.reactiveSender()).toLowerCase();
-  if (configuredReactiveSender !== expectedReactiveSender) {
-    throw new Error(
-      `Reactive receiver reactiveSender mismatch: expected=${expectedReactiveSender} got=${configuredReactiveSender}`,
+    if (String(destinationReceiver).toLowerCase() !== expectedDestinationReceiver) {
+      throw new Error(
+        `Reactive dispatcher destinationReceiver mismatch: expected=${expectedDestinationReceiver} got=${String(destinationReceiver).toLowerCase()}`,
+      );
+    }
+
+    if (String(operator).toLowerCase() !== expectedOperator) {
+      throw new Error(
+        `Reactive dispatcher operator mismatch: expected=${expectedOperator} got=${String(operator).toLowerCase()}`,
+      );
+    }
+
+    const mapping = await withRetry(
+      () =>
+        withTimeout(
+          reactiveProvider.send("rnk_getRnkAddressMapping", [config.dispatcherAddress]),
+          preflightTimeoutMs,
+          "reactive preflight: rnk_getRnkAddressMapping",
+        ),
+      preflightRetryAttempts,
+      preflightRetryDelayMs,
+      "reactive preflight: dispatcher mapping read",
     );
+    const mappedRvmIdRaw = String(
+      (mapping as { rvmId?: unknown; RvmId?: unknown } | null | undefined)?.rvmId ??
+        (mapping as { rvmId?: unknown; RvmId?: unknown } | null | undefined)?.RvmId ??
+        "",
+    ).trim();
+    if (!mappedRvmIdRaw) {
+      throw new Error("Reactive dispatcher RVM mapping is missing (rnk_getRnkAddressMapping)");
+    }
+    const expectedReactiveSender = ethers.getAddress(mappedRvmIdRaw).toLowerCase();
+    const receiver = new ethers.Contract(config.receiverAddress, REACTIVE_RECEIVER_VIEW_ABI, destinationProvider);
+    const configuredReactiveSender = String(
+      await withRetry(
+        () => withTimeout(receiver.reactiveSender(), preflightTimeoutMs, "reactive preflight: receiver.reactiveSender"),
+        preflightRetryAttempts,
+        preflightRetryDelayMs,
+        "reactive preflight: receiver reactive sender read",
+      ),
+    ).toLowerCase();
+    if (configuredReactiveSender !== expectedReactiveSender) {
+      throw new Error(
+        `Reactive receiver reactiveSender mismatch: expected=${expectedReactiveSender} got=${configuredReactiveSender}`,
+      );
+    }
+
+    reactiveDispatcherResolvedSender = expectedReactiveSender;
+    reactiveDispatcherPreflightCacheKey = cacheKey;
   }
 
   const reactiveSystem = new ethers.Contract(REACTIVE_SYSTEM_ADDRESS, REACTIVE_SYSTEM_ABI, reactiveProvider);
-  let [dispatcherBalance, dispatcherDebt] = await Promise.all([
-    reactiveProvider.getBalance(config.dispatcherAddress),
-    reactiveSystem.debt(config.dispatcherAddress),
-  ]);
+  let [dispatcherBalance, dispatcherDebt] = await withRetry(
+    () =>
+      Promise.all([
+        withTimeout(reactiveProvider.getBalance(config.dispatcherAddress), preflightTimeoutMs, "reactive preflight: dispatcher balance"),
+        withTimeout(reactiveSystem.debt(config.dispatcherAddress), preflightTimeoutMs, "reactive preflight: dispatcher debt"),
+      ]),
+    preflightRetryAttempts,
+    preflightRetryDelayMs,
+    "reactive preflight: dispatcher funding reads",
+  );
   if (dispatcherBalance < dispatcherDebt) {
     const executor = new ethers.Wallet(config.executorPrivateKey, reactiveProvider);
-    const executorBalance = await reactiveProvider.getBalance(executor.address);
+    const executorBalance = await withTimeout(
+      reactiveProvider.getBalance(executor.address),
+      preflightTimeoutMs,
+      "reactive preflight: executor balance",
+    );
     const bufferRaw = String(process.env.REACTIVE_DISPATCHER_DEBT_BUFFER_ETH ?? "0.002").trim();
     const bufferWei = ethers.parseEther(bufferRaw || "0.002");
     const shortfall = dispatcherDebt - dispatcherBalance;
     const requiredValue = shortfall + bufferWei;
 
-    const gasPrice = await reactiveProvider.getFeeData().then((fee) => fee.gasPrice ?? 0n).catch(() => 0n);
+    const gasPrice = await withTimeout(
+      reactiveProvider.getFeeData().then((fee) => fee.gasPrice ?? 0n).catch(() => 0n),
+      preflightTimeoutMs,
+      "reactive preflight: feeData",
+    );
     const estimatedGasReserve = gasPrice > 0n ? gasPrice * 300_000n : ethers.parseEther("0.0001");
     if (executorBalance < requiredValue + estimatedGasReserve) {
       throw new Error(
@@ -223,13 +299,12 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
       );
     }
 
+    const dispatcherWithExecutor = new ethers.Contract(config.dispatcherAddress, REACTIVE_DISPATCHER_ABI, executor);
     const topupTx = await executor.sendTransaction({
       to: config.dispatcherAddress,
       value: requiredValue,
     });
     await topupTx.wait();
-
-    const dispatcherWithExecutor = new ethers.Contract(config.dispatcherAddress, REACTIVE_DISPATCHER_ABI, executor);
     const coverTx = await dispatcherWithExecutor.coverDebt();
     await coverTx.wait();
 
@@ -245,8 +320,6 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
     }
   }
 
-  reactiveDispatcherResolvedSender = expectedReactiveSender;
-  reactiveDispatcherPreflightCacheKey = cacheKey;
 };
 
 const getReactiveSenderForPayload = async (config: ReactiveTransportConfig): Promise<string> => {
@@ -429,7 +502,13 @@ const sendEvmChainTx = async (
 export const getOnchainFeeBps = async (leagueAddress: string): Promise<number> => {
   const provider = await getRuntimeProvider();
   const league = new ethers.Contract(leagueAddress, ["function feeBps() view returns (uint16)"], provider);
-  return Number(await league.feeBps());
+  return Number(
+    await withTimeout(
+      league.feeBps(),
+      REACTIVE_DESTINATION_READ_TIMEOUT_MS,
+      "feeBps()",
+    ),
+  );
 };
 
 export const getOnchainWeekState = async (leagueAddress: string, weekId: bigint): Promise<ChainWeekState> => {
@@ -441,7 +520,11 @@ export const getOnchainWeekState = async (leagueAddress: string, weekId: bigint)
     ],
     provider,
   );
-  const state = await league.weekStates(weekId);
+  const state = await withTimeout(
+    league.weekStates(weekId),
+    REACTIVE_DESTINATION_READ_TIMEOUT_MS,
+    `weekStates(${weekId.toString()})`,
+  );
   return {
     startAt: asBigInt(state[0]),
     lockAt: asBigInt(state[1]),
@@ -468,7 +551,11 @@ export const getOnchainPosition = async (
     ],
     provider,
   );
-  const state = await league.positions(weekId, address);
+  const state = await withTimeout(
+    league.positions(weekId, address),
+    REACTIVE_DESTINATION_READ_TIMEOUT_MS,
+    `positions(${weekId.toString()},${address})`,
+  );
   return {
     principal: asBigInt(state.principal ?? state[0]),
     risk: asBigInt(state.risk ?? state[1]),
@@ -482,13 +569,25 @@ export const getOnchainPosition = async (
 export const getOnchainTestMode = async (leagueAddress: string): Promise<boolean> => {
   const provider = await getRuntimeProvider();
   const league = new ethers.Contract(leagueAddress, ["function testMode() view returns (bool)"], provider);
-  return Boolean(await league.testMode());
+  return Boolean(
+    await withTimeout(
+      league.testMode(),
+      REACTIVE_DESTINATION_READ_TIMEOUT_MS,
+      "testMode()",
+    ),
+  );
 };
 
 export const getOnchainPaused = async (leagueAddress: string): Promise<boolean> => {
   const provider = await getRuntimeProvider();
   const league = new ethers.Contract(leagueAddress, ["function paused() view returns (bool)"], provider);
-  return Boolean(await league.paused());
+  return Boolean(
+    await withTimeout(
+      league.paused(),
+      REACTIVE_DESTINATION_READ_TIMEOUT_MS,
+      "paused()",
+    ),
+  );
 };
 
 export const createWeekOnchain = async (
