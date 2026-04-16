@@ -75,6 +75,9 @@ const EnvSchema = z.object({
   SENTINEL_PRIVATE_KEY: z.string().optional(),
   SENTINEL_ACCOUNT_ADDRESS: z.string().optional(),
   SENTINEL_STABLECOIN_DEPOSIT: z.string().default("120"),
+  CHAIN_GAS_BANK_PRIVATE_KEY: z.string().optional(),
+  CHAIN_GAS_MIN_BALANCE_ETH: z.string().default("0.02"),
+  CHAIN_GAS_BANK_TOPUP_ETH: z.string().default("0.3"),
 
   PRINCIPAL_RATIO_BPS: z.string().default("8000"),
   PROTOCOL_FEE_BPS: z.string().default("1000"),
@@ -91,6 +94,10 @@ const EnvSchema = z.object({
   REACTIVE_CHAIN_RPC_URL: z.string().default("https://lasna-rpc.rnk.dev"),
   REACTIVE_CHAIN_ID: z.string().default("5318007"),
   REACTIVE_EXECUTOR_PRIVATE_KEY: z.string().optional(),
+  REACTIVE_GAS_BANK_PRIVATE_KEY: z.string().optional(),
+  REACTIVE_EXECUTOR_MIN_BALANCE_ETH: z.string().default("0.03"),
+  REACTIVE_GAS_BANK_TOPUP_ETH: z.string().default("3"),
+  REACTIVE_DISPATCHER_DEBT_BUFFER_ETH: z.string().default("0.02"),
   REACTIVE_DISPATCHER_ADDRESS: z.string().optional(),
   REACTIVE_RECEIVER_ADDRESS: z.string().optional(),
   REACTIVE_CALLBACK_SENDER_ADDRESS: z.string().optional(),
@@ -141,6 +148,7 @@ const EnvSchema = z.object({
 });
 
 export const env = EnvSchema.parse(process.env);
+
 
 
 

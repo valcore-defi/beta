@@ -380,13 +380,12 @@ export const markLifecycleTxIntentSubmitted = async (id, txHash, detailsJson) =>
     UPDATE lifecycle_tx_intents
     SET
       status = CASE WHEN status = 'completed' THEN status ELSE 'submitted' END,
-      tx_hash = COALESCE(tx_hash, $2),
+      tx_hash = CASE WHEN status = 'completed' THEN tx_hash ELSE $2 END,
       details_json = COALESCE($3, details_json),
-      last_error = null,
+      last_error = CASE WHEN status = 'completed' THEN last_error ELSE null END,
       resolved_at = CASE WHEN status = 'completed' THEN resolved_at ELSE null END,
       updated_at = now()::text
     WHERE id = $1
-      AND (tx_hash IS NULL OR tx_hash = $2)
     RETURNING *
   `, [id, String(txHash ?? '').toLowerCase(), detailsJson ?? null]);
     return rows[0] ?? null;

@@ -385,6 +385,31 @@ const run = async () => {
   let txHash: string | null = intent.tx_hash ? String(intent.tx_hash).toLowerCase() : null;
   let reactiveTxHash: string | null = isReactiveEvm ? txHash : null;
 
+  // If a previous finalize intent is stale while on-chain is still ACTIVE (3),
+  // clear stale hash and allow this run to submit a fresh reactive finalize dispatch.
+  if (txHash && chainEnabled && leagueAddress) {
+    const intentState = String(intent.status ?? "").toLowerCase();
+    const onchainNow = await getOnchainWeekState(leagueAddress, weekId);
+    const onchainNowStatus = Number(onchainNow.status ?? 0);
+    if (onchainNowStatus === 3) {
+      const pendingSinceMs = getIntentUpdatedAtMs(intent as { updated_at?: unknown });
+      const reactiveStallGraceMs = Math.max(
+        15_000,
+        Number(env.REACTIVE_STALL_GRACE_SECONDS ?? "120") * 1000,
+      );
+      const staleSubmitted = pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs;
+      if (intentState === "failed" || intentState === "error" || staleSubmitted) {
+        if (staleSubmitted) {
+          console.warn(
+            `[run-finalize] stale reactive finalize callback detected for week ${week.id}; resubmitting with fresh intent tx`,
+          );
+        }
+        txHash = null;
+        reactiveTxHash = null;
+      }
+    }
+  }
+
   try {
     if (!txHash && leagueAddress) {
       const onchainTestMode = await getOnchainTestMode(leagueAddress);

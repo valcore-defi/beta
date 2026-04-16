@@ -50,9 +50,13 @@ const REACTIVE_RECEIVER_ABI = [
   "function rxFinalize(address,bytes32,uint256,bytes32,bytes32,uint256,bool)",
   "function rxApprove(address,bytes32,uint256)",
   "function rxReject(address,bytes32,uint256)",
+  "function coverDebt()",
 ] as const;
 const REACTIVE_RECEIVER_VIEW_ABI = [
   "function reactiveSender() view returns (address)",
+] as const;
+const REACTIVE_CALLBACK_PROXY_ABI = [
+  "function debt(address) view returns (uint256)",
 ] as const;
 const REACTIVE_SYSTEM_ABI = [
   "function debt(address) view returns (uint256)",
@@ -91,6 +95,107 @@ const toPositiveIntEnv = (value: string | undefined, fallback: number) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.floor(parsed);
+};
+
+const FUNDING_PENDING_PREFIX = "FUNDING_PENDING";
+
+const parseEthEnvToWei = (raw: string | undefined, fallback: string, label: string): bigint => {
+  const text = String(raw ?? "").trim() || fallback;
+  try {
+    return ethers.parseEther(text);
+  } catch {
+    throw new Error(`${label} is invalid: ${text}`);
+  }
+};
+
+const CHAIN_GAS_MIN_BALANCE_WEI = parseEthEnvToWei(
+  env.CHAIN_GAS_MIN_BALANCE_ETH,
+  "0.02",
+  "CHAIN_GAS_MIN_BALANCE_ETH",
+);
+const CHAIN_GAS_BANK_TOPUP_WEI = parseEthEnvToWei(
+  env.CHAIN_GAS_BANK_TOPUP_ETH,
+  "0.3",
+  "CHAIN_GAS_BANK_TOPUP_ETH",
+);
+const REACTIVE_EXECUTOR_MIN_BALANCE_WEI = parseEthEnvToWei(
+  env.REACTIVE_EXECUTOR_MIN_BALANCE_ETH,
+  "0.03",
+  "REACTIVE_EXECUTOR_MIN_BALANCE_ETH",
+);
+const REACTIVE_GAS_BANK_TOPUP_WEI = parseEthEnvToWei(
+  env.REACTIVE_GAS_BANK_TOPUP_ETH,
+  "3",
+  "REACTIVE_GAS_BANK_TOPUP_ETH",
+);
+const REACTIVE_RECEIVER_DEBT_BUFFER_WEI = parseEthEnvToWei(
+  (env as any).REACTIVE_RECEIVER_DEBT_BUFFER_ETH ?? env.REACTIVE_DISPATCHER_DEBT_BUFFER_ETH,
+  "0.02",
+  "REACTIVE_RECEIVER_DEBT_BUFFER_ETH",
+);
+
+const ensureWalletFundedByBank = async ({
+  provider,
+  targetAddress,
+  targetLabel,
+  minBalanceWei,
+  topupWei,
+  bankPrivateKey,
+  bankLabel,
+}: {
+  provider: ethers.Provider;
+  targetAddress: string;
+  targetLabel: string;
+  minBalanceWei: bigint;
+  topupWei: bigint;
+  bankPrivateKey?: string;
+  bankLabel: string;
+}) => {
+  const currentBalance = await provider.getBalance(targetAddress);
+  if (currentBalance >= minBalanceWei) return;
+
+  const missing = minBalanceWei - currentBalance;
+  const bankPk = String(bankPrivateKey ?? "").trim();
+  if (!bankPk) {
+    throw new Error(
+      `${FUNDING_PENDING_PREFIX}: ${targetLabel} low balance (${ethers.formatEther(currentBalance)} < ${ethers.formatEther(
+        minBalanceWei,
+      )}). Fund ${targetAddress} manually or set ${bankLabel}. Missing at least ${ethers.formatEther(missing)} native.`,
+    );
+  }
+
+  const bankWallet = new ethers.Wallet(bankPk, provider);
+  const normalizedTarget = ethers.getAddress(targetAddress);
+  if (bankWallet.address.toLowerCase() === normalizedTarget.toLowerCase()) {
+    throw new Error(`${FUNDING_PENDING_PREFIX}: ${bankLabel} cannot equal target wallet ${normalizedTarget}`);
+  }
+
+  const bankBalance = await provider.getBalance(bankWallet.address);
+  const feeData = await provider.getFeeData().catch(() => null);
+  const gasPrice = feeData?.gasPrice ?? 0n;
+  const gasReserve = gasPrice > 0n ? gasPrice * 120_000n : ethers.parseEther("0.0002");
+  if (bankBalance < topupWei + gasReserve) {
+    throw new Error(
+      `${FUNDING_PENDING_PREFIX}: ${bankLabel} (${bankWallet.address}) has insufficient balance. Need ${ethers.formatEther(
+        topupWei + gasReserve,
+      )}, have ${ethers.formatEther(bankBalance)}.`,
+    );
+  }
+
+  const topupTx = await bankWallet.sendTransaction({
+    to: normalizedTarget,
+    value: topupWei,
+  });
+  await topupTx.wait();
+
+  const afterBalance = await provider.getBalance(normalizedTarget);
+  if (afterBalance < minBalanceWei) {
+    throw new Error(
+      `${FUNDING_PENDING_PREFIX}: ${targetLabel} still below minimum after bank top-up. Current ${ethers.formatEther(
+        afterBalance,
+      )}, required ${ethers.formatEther(minBalanceWei)}.`,
+    );
+  }
 };
 
 const resolveLifecycleIntentOpKey = (value: string | undefined, fallback: string) => {
@@ -183,9 +288,13 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
   const preflightTimeoutMs = Math.max(3000, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_TIMEOUT_MS, 15000));
   const preflightRetryAttempts = Math.max(1, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_RETRY_ATTEMPTS, 3));
   const preflightRetryDelayMs = Math.max(250, toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_RETRY_DELAY_MS, 1200));
+  const preflightTxWaitMs = Math.max(
+    preflightTimeoutMs,
+    toPositiveIntEnv(process.env.REACTIVE_PREFLIGHT_TX_WAIT_MS, 180000),
+  );
+  const destinationProvider = await getRuntimeProvider();
 
   if (!cachedStaticPreflight) {
-    const destinationProvider = await getRuntimeProvider();
     const destinationNetwork = await withTimeout(
       destinationProvider.getNetwork(),
       preflightTimeoutMs,
@@ -264,6 +373,17 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
     reactiveDispatcherPreflightCacheKey = cacheKey;
   }
 
+  const executor = new ethers.Wallet(config.executorPrivateKey, reactiveProvider);
+  await ensureWalletFundedByBank({
+    provider: reactiveProvider,
+    targetAddress: executor.address,
+    targetLabel: `reactive executor ${executor.address}`,
+    minBalanceWei: REACTIVE_EXECUTOR_MIN_BALANCE_WEI,
+    topupWei: REACTIVE_GAS_BANK_TOPUP_WEI,
+    bankPrivateKey: env.REACTIVE_GAS_BANK_PRIVATE_KEY,
+    bankLabel: "REACTIVE_GAS_BANK_PRIVATE_KEY",
+  });
+
   const reactiveSystem = new ethers.Contract(REACTIVE_SYSTEM_ADDRESS, REACTIVE_SYSTEM_ABI, reactiveProvider);
   let [dispatcherBalance, dispatcherDebt] = await withRetry(
     () =>
@@ -275,17 +395,16 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
     preflightRetryDelayMs,
     "reactive preflight: dispatcher funding reads",
   );
-  if (dispatcherBalance < dispatcherDebt) {
-    const executor = new ethers.Wallet(config.executorPrivateKey, reactiveProvider);
-    const executorBalance = await withTimeout(
+  const bufferRaw = String(env.REACTIVE_DISPATCHER_DEBT_BUFFER_ETH ?? "0.02").trim();
+  const bufferWei = ethers.parseEther(bufferRaw || "0.02");
+  const requiredDispatcherBalance = dispatcherDebt + bufferWei;
+  if (dispatcherBalance < requiredDispatcherBalance) {
+    let executorBalance = await withTimeout(
       reactiveProvider.getBalance(executor.address),
       preflightTimeoutMs,
       "reactive preflight: executor balance",
     );
-    const bufferRaw = String(process.env.REACTIVE_DISPATCHER_DEBT_BUFFER_ETH ?? "0.002").trim();
-    const bufferWei = ethers.parseEther(bufferRaw || "0.002");
-    const shortfall = dispatcherDebt - dispatcherBalance;
-    const requiredValue = shortfall + bufferWei;
+    const requiredValue = requiredDispatcherBalance - dispatcherBalance;
 
     const gasPrice = await withTimeout(
       reactiveProvider.getFeeData().then((fee) => fee.gasPrice ?? 0n).catch(() => 0n),
@@ -294,28 +413,164 @@ const ensureReactiveDispatcherPreflight = async (config: ReactiveTransportConfig
     );
     const estimatedGasReserve = gasPrice > 0n ? gasPrice * 300_000n : ethers.parseEther("0.0001");
     if (executorBalance < requiredValue + estimatedGasReserve) {
-      throw new Error(
-        `Reactive dispatcher underfunded and executor has insufficient balance: dispatcher=${config.dispatcherAddress} balance=${ethers.formatEther(dispatcherBalance)} debt=${ethers.formatEther(dispatcherDebt)} requiredTopup=${ethers.formatEther(requiredValue)} executor=${executor.address} executorBalance=${ethers.formatEther(executorBalance)}`,
+      await ensureWalletFundedByBank({
+        provider: reactiveProvider,
+        targetAddress: executor.address,
+        targetLabel: `reactive executor ${executor.address} (debt cover)`,
+        minBalanceWei: requiredValue + estimatedGasReserve,
+        topupWei: REACTIVE_GAS_BANK_TOPUP_WEI,
+        bankPrivateKey: env.REACTIVE_GAS_BANK_PRIVATE_KEY,
+        bankLabel: "REACTIVE_GAS_BANK_PRIVATE_KEY",
+      });
+      executorBalance = await withTimeout(
+        reactiveProvider.getBalance(executor.address),
+        preflightTimeoutMs,
+        "reactive preflight: executor balance post-topup",
       );
+      if (executorBalance < requiredValue + estimatedGasReserve) {
+        throw new Error(
+          `${FUNDING_PENDING_PREFIX}: Reactive dispatcher debt cover still lacks executor balance. dispatcher=${config.dispatcherAddress} balance=${ethers.formatEther(
+            dispatcherBalance,
+          )} debt=${ethers.formatEther(dispatcherDebt)} requiredTopup=${ethers.formatEther(
+            requiredValue,
+          )} executor=${executor.address} executorBalance=${ethers.formatEther(executorBalance)}`,
+        );
+      }
     }
 
     const dispatcherWithExecutor = new ethers.Contract(config.dispatcherAddress, REACTIVE_DISPATCHER_ABI, executor);
-    const topupTx = await executor.sendTransaction({
-      to: config.dispatcherAddress,
-      value: requiredValue,
-    });
-    await topupTx.wait();
-    const coverTx = await dispatcherWithExecutor.coverDebt();
-    await coverTx.wait();
+    const topupTx = await withTimeout(
+      executor.sendTransaction({
+        to: config.dispatcherAddress,
+        value: requiredValue,
+      }),
+      preflightTimeoutMs,
+      "reactive preflight: dispatcher topup send",
+    );
+    await withTimeout(
+      topupTx.wait(),
+      preflightTxWaitMs,
+      "reactive preflight: dispatcher topup confirmation",
+    );
+    if (dispatcherDebt > 0n) {
+      const coverTx = await withTimeout(
+        dispatcherWithExecutor.coverDebt(),
+        preflightTimeoutMs,
+        "reactive preflight: coverDebt send",
+      );
+      await withTimeout(
+        coverTx.wait(),
+        preflightTxWaitMs,
+        "reactive preflight: coverDebt confirmation",
+      );
+    }
 
-    [dispatcherBalance, dispatcherDebt] = await Promise.all([
-      reactiveProvider.getBalance(config.dispatcherAddress),
-      reactiveSystem.debt(config.dispatcherAddress),
-    ]);
+    [dispatcherBalance, dispatcherDebt] = await withRetry(
+      () =>
+        Promise.all([
+          withTimeout(
+            reactiveProvider.getBalance(config.dispatcherAddress),
+            preflightTimeoutMs,
+            "reactive preflight: dispatcher balance post-topup",
+          ),
+          withTimeout(
+            reactiveSystem.debt(config.dispatcherAddress),
+            preflightTimeoutMs,
+            "reactive preflight: dispatcher debt post-topup",
+          ),
+        ]),
+      preflightRetryAttempts,
+      preflightRetryDelayMs,
+      "reactive preflight: dispatcher funding reads post-topup",
+    );
 
-    if (dispatcherBalance < dispatcherDebt) {
+    if (dispatcherBalance < dispatcherDebt + bufferWei) {
       throw new Error(
-        `Reactive dispatcher still underfunded after auto-cover: address=${config.dispatcherAddress} balance=${ethers.formatEther(dispatcherBalance)} debt=${ethers.formatEther(dispatcherDebt)}`,
+        `Reactive dispatcher still underfunded after auto-topup: address=${config.dispatcherAddress} balance=${ethers.formatEther(dispatcherBalance)} debt=${ethers.formatEther(dispatcherDebt)} buffer=${ethers.formatEther(bufferWei)}`,
+      );
+    }
+  }
+
+  const callbackProxyAddress = normalizeAddress(
+    String(env.REACTIVE_CALLBACK_PROXY_ADDRESS ?? "").trim(),
+    "REACTIVE_CALLBACK_PROXY_ADDRESS",
+  );
+  const callbackProxy = new ethers.Contract(callbackProxyAddress, REACTIVE_CALLBACK_PROXY_ABI, destinationProvider);
+
+  let [receiverDebt, receiverBalance] = await withRetry(
+    () =>
+      Promise.all([
+        withTimeout(
+          callbackProxy.debt(config.receiverAddress),
+          preflightTimeoutMs,
+          "reactive preflight: callbackProxy.debt(receiver)",
+        ),
+        withTimeout(
+          destinationProvider.getBalance(config.receiverAddress),
+          preflightTimeoutMs,
+          "reactive preflight: receiver balance",
+        ),
+      ]),
+    preflightRetryAttempts,
+    preflightRetryDelayMs,
+    "reactive preflight: receiver debt reads",
+  );
+
+  const requiredReceiverBalance = receiverDebt + REACTIVE_RECEIVER_DEBT_BUFFER_WEI;
+  if (receiverBalance < requiredReceiverBalance) {
+    await ensureWalletFundedByBank({
+      provider: destinationProvider,
+      targetAddress: config.receiverAddress,
+      targetLabel: `reactive receiver ${config.receiverAddress}`,
+      minBalanceWei: requiredReceiverBalance,
+      topupWei: CHAIN_GAS_BANK_TOPUP_WEI,
+      bankPrivateKey: env.CHAIN_GAS_BANK_PRIVATE_KEY,
+      bankLabel: "CHAIN_GAS_BANK_PRIVATE_KEY",
+    });
+    receiverBalance = await withTimeout(
+      destinationProvider.getBalance(config.receiverAddress),
+      preflightTimeoutMs,
+      "reactive preflight: receiver balance post-topup",
+    );
+    if (receiverBalance < requiredReceiverBalance) {
+      throw new Error(
+        `${FUNDING_PENDING_PREFIX}: reactive receiver still underfunded after top-up. receiver=${config.receiverAddress} balance=${ethers.formatEther(
+          receiverBalance,
+        )} required=${ethers.formatEther(requiredReceiverBalance)}`,
+      );
+    }
+  }
+
+  if (receiverDebt > 0n) {
+    const debtSettlerPk = String(env.CHAIN_GAS_BANK_PRIVATE_KEY ?? "").trim() || await getRequiredRuntimeOraclePrivateKey();
+    const debtSettler = new ethers.Wallet(debtSettlerPk, destinationProvider);
+    const receiverWithSettler = new ethers.Contract(config.receiverAddress, REACTIVE_RECEIVER_ABI, debtSettler);
+    const coverTx = (await withTimeout(
+      (receiverWithSettler as any).coverDebt(),
+      preflightTimeoutMs,
+      "reactive preflight: receiver coverDebt send",
+    )) as { wait: () => Promise<unknown> };
+    await withTimeout(
+      coverTx.wait(),
+      preflightTxWaitMs,
+      "reactive preflight: receiver coverDebt confirmation",
+    );
+
+    receiverDebt = await withRetry(
+      () =>
+        withTimeout(
+          callbackProxy.debt(config.receiverAddress),
+          preflightTimeoutMs,
+          "reactive preflight: callbackProxy.debt(receiver) post-cover",
+        ),
+      preflightRetryAttempts,
+      preflightRetryDelayMs,
+      "reactive preflight: receiver debt read post-cover",
+    );
+
+    if (receiverDebt > 0n) {
+      throw new Error(
+        `Reactive receiver debt remains after coverDebt: receiver=${config.receiverAddress} debt=${ethers.formatEther(receiverDebt)}`,
       );
     }
   }
@@ -432,11 +687,20 @@ const dispatchReactiveCallback = async (
   const reactiveProvider = new ethers.JsonRpcProvider(config.rpcUrl, config.chainId);
   const reactiveWallet = new ethers.Wallet(config.executorPrivateKey, reactiveProvider);
   const dispatcher = new ethers.Contract(config.dispatcherAddress, REACTIVE_DISPATCHER_ABI, reactiveWallet);
-  const sent = await sendTxWithPolicy({
-    label,
-    signer: reactiveWallet,
-    send: (overrides) => (dispatcher as any).dispatch(payload, config.gasLimit, overrides),
-  });
+  let sent: Awaited<ReturnType<typeof sendTxWithPolicy>>;
+  try {
+    sent = await sendTxWithPolicy({
+      label,
+      signer: reactiveWallet,
+      send: (overrides) => (dispatcher as any).dispatch(payload, config.gasLimit, overrides),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    if (message.toLowerCase().includes("insufficient funds")) {
+      throw new Error(`${FUNDING_PENDING_PREFIX}: reactive dispatcher send has insufficient funds. ${message}`);
+    }
+    throw error;
+  }
 
   const reactiveTxHash = String(sent.txHash ?? "").toLowerCase();
   try {
@@ -486,15 +750,34 @@ const sendEvmChainTx = async (
   const wallet = new ethers.Wallet(privateKey, provider);
   const contract = new ethers.Contract(contractAddress, abi, wallet);
 
-  const sent = await sendTxWithPolicy({
-    label,
-    signer: wallet,
-    send: (overrides) =>
-      sender(
-        contract,
-        overrides,
-      ) as Promise<{ hash: string; wait: (confirmations?: number) => Promise<ethers.TransactionReceipt | null> }>,
+  await ensureWalletFundedByBank({
+    provider,
+    targetAddress: wallet.address,
+    targetLabel: `${label} signer ${wallet.address}`,
+    minBalanceWei: CHAIN_GAS_MIN_BALANCE_WEI,
+    topupWei: CHAIN_GAS_BANK_TOPUP_WEI,
+    bankPrivateKey: env.CHAIN_GAS_BANK_PRIVATE_KEY,
+    bankLabel: "CHAIN_GAS_BANK_PRIVATE_KEY",
   });
+
+  let sent: Awaited<ReturnType<typeof sendTxWithPolicy>>;
+  try {
+    sent = await sendTxWithPolicy({
+      label,
+      signer: wallet,
+      send: (overrides) =>
+        sender(
+          contract,
+          overrides,
+        ) as Promise<{ hash: string; wait: (confirmations?: number) => Promise<ethers.TransactionReceipt | null> }>,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    if (message.toLowerCase().includes("insufficient funds")) {
+      throw new Error(`${FUNDING_PENDING_PREFIX}: ${label} signer has insufficient funds. ${message}`);
+    }
+    throw error;
+  }
 
   return sent.txHash;
 };
@@ -890,4 +1173,5 @@ export const mintStablecoinOnchain = async (
       (token as any).mint(recipient, amountWei, overrides),
   );
 };
+
 

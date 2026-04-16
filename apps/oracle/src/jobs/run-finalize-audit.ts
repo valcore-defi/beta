@@ -159,7 +159,7 @@ const run = async () => {
   const artifactsMissing = !existsSync(claimsPath) || !existsSync(metadataPath);
   if (artifactsMissing) {
     const lineups = await getLineups(week.id);
-    if (lineups.length === 0 && chainEnabled) {
+    if (chainEnabled) {
       const state = await getOnchainWeekState(contractAddress, weekId);
       const onchainStatus = Number(state.status ?? 0);
       if (onchainStatus !== 4 && onchainStatus !== 5) {
@@ -187,7 +187,8 @@ const run = async () => {
           computedMetadataHash,
           retainedFeeWei: expectedRetainedFee.toString(),
           status: "FINALIZED",
-          fallback: "missing-artifacts-empty-week",
+          fallback: "missing-artifacts-onchain-fallback",
+          lineupCount: lineups.length,
         },
       });
       if (String(intent.status ?? "").toLowerCase() === "completed") {
@@ -197,6 +198,19 @@ const run = async () => {
 
       let txHash: string | null = intent.tx_hash ? String(intent.tx_hash).toLowerCase() : null;
       let reactiveTxHash: string | null = isReactiveEvm ? txHash : null;
+      if (isReactiveEvm && txHash && onchainStatus === 4) {
+        const intentState = String((intent as { status?: unknown }).status ?? "").toLowerCase();
+        const pendingSinceMs = getIntentUpdatedAtMs(intent as { updated_at?: unknown });
+        const reactiveStallGraceMs = Math.max(
+          15_000,
+          Number(env.REACTIVE_STALL_GRACE_SECONDS ?? "120") * 1000,
+        );
+        const staleSubmitted = pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs;
+        if (intentState === "failed" || intentState === "error" || staleSubmitted) {
+          txHash = null;
+          reactiveTxHash = null;
+        }
+      }
       if (onchainStatus === 4 && !txHash) {
         try {
           txHash = await sendApproveFinalizationOnchain(contractAddress, weekId, opKey);
@@ -209,7 +223,8 @@ const run = async () => {
               retainedFeeWei: expectedRetainedFee.toString(),
               chainExecuted: true,
               reactiveTxHash,
-              fallback: "missing-artifacts-empty-week",
+              fallback: "missing-artifacts-onchain-fallback",
+              lineupCount: lineups.length,
             })) ?? intent;
         } catch (error) {
           const dispatchedReactiveTx = extractReactiveTxHash(error);
@@ -225,7 +240,8 @@ const run = async () => {
                 chainExecuted: true,
                 reactiveTxHash,
                 pendingConfirmation: true,
-                fallback: "missing-artifacts-empty-week",
+                fallback: "missing-artifacts-onchain-fallback",
+                lineupCount: lineups.length,
               })) ?? intent;
             console.log(
               `[run-finalize-audit] reactive approve submitted tx=${dispatchedReactiveTx}; waiting callback confirmation`,
@@ -272,7 +288,8 @@ const run = async () => {
         status: "FINALIZED",
         chainExecuted: true,
             reactiveTxHash,
-            fallback: "missing-artifacts-empty-week",
+            fallback: "missing-artifacts-onchain-fallback",
+            lineupCount: lineups.length,
       });
       return;
     }
@@ -354,6 +371,19 @@ const run = async () => {
       }
       if (onchainRetainedFee !== expectedRetainedFee) {
         throw new Error("Finalize audit failed: retained fee mismatch");
+      }
+      if (isReactiveEvm && txHash && onchainStatus === 4) {
+        const intentState = String((intent as { status?: unknown }).status ?? "").toLowerCase();
+        const pendingSinceMs = getIntentUpdatedAtMs(intent as { updated_at?: unknown });
+        const reactiveStallGraceMs = Math.max(
+          15_000,
+          Number(env.REACTIVE_STALL_GRACE_SECONDS ?? "120") * 1000,
+        );
+        const staleSubmitted = pendingSinceMs > 0 && Date.now() - pendingSinceMs > reactiveStallGraceMs;
+        if (intentState === "failed" || intentState === "error" || staleSubmitted) {
+          txHash = null;
+          reactiveTxHash = null;
+        }
       }
 
       if (onchainStatus === 4 && !txHash) {
