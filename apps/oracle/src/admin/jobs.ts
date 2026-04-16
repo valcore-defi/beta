@@ -75,6 +75,9 @@ const killProcessTree = (child: ChildProcess) => {
 const MAX_OUTPUT_CHARS = 8000;
 const RETRYABLE_JOBS = new Set(["run-week", "refresh-week-coins", "transition-lock", "transition-start", "finalize", "finalize-audit"]);
 const TRANSIENT_HINTS = [
+  "funding_pending",
+  "underfunded",
+  "insufficient funds",
   "timeout",
   "timed out",
   "econnreset",
@@ -100,7 +103,6 @@ const TRANSIENT_HINTS = [
 ];
 
 const NON_RETRYABLE_SYSTEM_HINTS = [
-  "insufficient funds",
   "already known",
   "already imported",
   "invalid sender",
