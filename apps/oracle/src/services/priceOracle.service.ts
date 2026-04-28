@@ -243,6 +243,20 @@ export const getLivePrices = async (
     return { ...cached, ...stale };
   }
 
+  // If cache is empty, avoid blocking UI requests on upstream latency.
+  // Start one background refresh and return quickly with empty payload.
+  if (
+    blockingSymbols.length > 0 &&
+    Object.keys(cached).length === 0 &&
+    Object.keys(stale).length === 0
+  ) {
+    const backgroundSymbols = Array.from(new Set([...blockingSymbols, ...asyncRetrySymbols]));
+    if (backgroundSymbols.length > 0) {
+      void refreshLiveCache(backgroundSymbols).catch(() => undefined);
+    }
+    return {};
+  }
+
   // Fetch fresh prices
   try {
     const freshPrices = await refreshLiveCache(blockingSymbols);
