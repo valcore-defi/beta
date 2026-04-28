@@ -537,9 +537,9 @@ export default function LineupPage() {
   const isParticipationKnown = isWeekActive
     ? walletIdentityResolved && participationResolved
     : true;
-  const hasWeekParticipation =
-    Boolean(walletAddress) &&
-    (Boolean(onchainDeposit && onchainDeposit > 0n) || hasDbLineupCommit);
+  const hasOnchainWeekCommit = onchainPositionResolved && Boolean(onchainDeposit && onchainDeposit > 0n);
+  const hasDbWeekCommit = dbLineupChecked && hasDbLineupCommit;
+  const hasWeekParticipation = Boolean(walletAddress) && (hasOnchainWeekCommit || hasDbWeekCommit);
   const canUseWeekControls = isWeekActive && hasWeekParticipation;
   const isSpectatorWeekView = isWeekActive && isParticipationKnown && !canUseWeekControls;
   const isWeekPendingIdentity = isWeekActive && !isParticipationKnown;
@@ -748,6 +748,8 @@ export default function LineupPage() {
     lineupContextKeyRef.current = lineupContextKey;
     setDbLineupIds(null);
     setDbLineupChecked(false);
+    setOnchainDeposit(null);
+    setOnchainPositionResolved(false);
     setSwapCount(0);
     setLineup(createLineup(slots));
     setSelectedSlotId(null);
@@ -4618,4 +4620,3 @@ export default function LineupPage() {
     </>
   );
 }
-
