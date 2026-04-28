@@ -428,7 +428,19 @@ export function Hud() {
   const movesTotal = moves?.total ?? 0;
   const isWeekActive = week?.status === "ACTIVE";
   const showGuideButton = showMoves;
-  const showMovesPanel = showMoves && isWeekActive;
+  const hasActiveParticipantControls =
+    showMoves &&
+    isWeekActive &&
+    Boolean(address) &&
+    Boolean(moves) &&
+    Number(movesTotal) > 0;
+  const showMovesPanel = hasActiveParticipantControls;
+
+  useEffect(() => {
+    if (hasActiveParticipantControls) return;
+    if (!swapMode) return;
+    setSwapMode(false);
+  }, [hasActiveParticipantControls, setSwapMode, swapMode]);
 
   const openProtocolGuide = (section: "tactical-moves" | "welcome", markSeen = false) => {
     if (typeof window === "undefined") return;
@@ -476,7 +488,7 @@ export function Hud() {
               <button
                 type="button"
                 className={`hud-swap-toggle ${swapMode ? "active" : ""} ${isWeekActive ? "" : "disabled"}`}
-                disabled={!isWeekActive}
+                disabled={!hasActiveParticipantControls}
                 onClick={() => setSwapMode((prev) => !prev)}
               >
                 <span className="hud-swap-text">
